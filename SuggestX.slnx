@@ -1,0 +1,14 @@
+<Solution>
+  <Folder Name="/src/" />
+  <Folder Name="/src/services/">
+    <Project Path="src/services/SuggestX.Aggregator/SuggestX.Aggregator.csproj" />
+    <Project Path="src/services/SuggestX.CollectionService/SuggestX.CollectionService.csproj" />
+    <Project Path="src/services/SuggestX.Gateway/SuggestX.Gateway.csproj" />
+    <Project Path="src/services/SuggestX.SuggestionService/SuggestX.SuggestionService.csproj" />
+    <Project Path="src/services/SuggestX.TrieBuilder/SuggestX.TrieBuilder.csproj" />
+  </Folder>
+  <Folder Name="/src/shared/">
+    <Project Path="src/shared/SuggestX.Contracts/SuggestX.Contracts.csproj" />
+    <Project Path="src/shared/SuggestX.ServiceDefaults/SuggestX.ServiceDefaults.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,201 @@
+# SuggestX
+
+A working typeahead/autocomplete system, built end to end to internalise
+*Grokking Modern System Design Interview*'s "Typeahead Suggestion System"
+chapters. This document is revision material — it explains what was built,
+why, and how to see it working — updated at the end of every phase, not a
+running change log. For the decision-by-decision reasoning and the
+failure-mode/Q&A material, see `DESIGN.md`. For live build state, see
+`PROGRESS.md`.
+
+## What is a typeahead suggestion system?
+
+As a user types into a search box, the system suggests the most likely
+completions of what they're typing — one request per keystroke, answered in
+under 200ms, ranked by how often that completion has actually been searched
+by everyone. Google Search, e-commerce product search, and code editor
+autocomplete are all instances of the same problem: **fast prefix lookup
+against a ranked, constantly-shifting set of strings, at a request volume
+that makes "just query a database" impossible.**
+
+The one functional requirement is deceptively small — *return the top N
+completions for a prefix* — but it forces almost every other decision in the
+system, because "under 200ms, at Google scale" rules out doing any real work
+in that 200ms. Everything interesting about this design is about *where the
+real work happens instead*.
+
+## The shape of the system, in one paragraph
+
+A **Suggestion Service** answers every keystroke with a single cache lookup —
+no computation, no database query, no trie traversal, at request time. Behind
+it, entirely offline, an **assembler pipeline** (Collection → Aggregator →
+Trie Builder) logs what people search, periodically aggregates those logs into
+frequency counts, periodically rebuilds a compressed trie from those counts,
+and periodically publishes a flattened `prefix → top-N` projection of that
+trie into the cache the Suggestion Service reads. The read path and the write
+pipeline never touch each other directly — the only thing that crosses
+between them is a new cache version, swapped in atomically once it's fully
+built. That's the whole system; every store choice below exists to make that
+one sentence true under real load.
+
+## Why this project has no code yet
+
+This is Phase 0. The six source chapters were read in full first — this
+system, unlike a from-scratch build, comes from a design document with
+specific named components (a compressed trie, an assembler with three named
+sub-services, ZooKeeper-coordinated cache swaps), and the point of this
+project is to give each of those a real, running counterpart rather than
+inventing an architecture that happens to also do autocomplete. `CLAUDE.md`
+and `DESIGN.md` were written from that reading before any scaffolding, so the
+architecture below is design-doc-first, not code-first.
+
+## Architecture
+
+Five services, each owning exactly one store (or, for the read-only
+`SuggestionService`, no durable store at all):
+
+| Service | Role | Owns | Doc component it implements |
+|---|---|---|---|
+| `SuggestionService` | Hot read path | — (stateless) | "Suggestion service" |
+| `CollectionService` | Ingests raw search events | `suggestx-raw-logs` (S3) | "Collection service" |
+| `Aggregator` | Batch-aggregates frequencies | `suggestx-phrase-frequencies` (DynamoDB) | "Aggregator" (MapReduce job) |
+| `TrieBuilder` | Rebuilds the trie, publishes it | `suggestx-trie-snapshots` (S3), the `trie:*` Redis namespace, ZooKeeper znodes | "Trie builder" |
+| `Gateway` | Routing + a small admin/insights view | — | "web servers" |
+
+Full reasoning for every store choice — including why there's deliberately no
+relational database anywhere in this system — is in `DESIGN.md` §1.
+
+### Why the read path is only ever a cache `GET`
+
+The source doc's own high-level design diagram shows the suggestion service
+reading "the top ten popular queries" straight from a Redis cache, not
+walking a trie over the network per keystroke. This build takes that
+literally: the compressed trie, as an actual in-memory data structure, exists
+**only inside `TrieBuilder`**. Each build cycle, `TrieBuilder` walks it once
+to precompute the top-N completions for every prefix up to a bounded length,
+and writes that flattened `prefix → top-N` map into Redis. `SuggestionService`
+never reconstructs or traverses anything — every request is one `GET`. The
+expensive part of "trie" — traversal — gets paid for once per aggregation
+cycle by one service, not once per keystroke by every user on earth. See
+`DESIGN.md` §1 decision 2 and the "trie traversal time" Q&A entry.
+
+## Resource estimates the design targets
+
+Carried straight from the source doc's Requirements chapter, since they're
+the numbers every later decision (partitioning, offline updates, caching) is
+actually answering:
+
+| Metric | Value |
+|---|---|
+| Total queries/day | 3.5 billion |
+| Unique queries/day (stored) | 2 billion |
+| Avg query length | 15 characters |
+| Storage/day | 60 GB |
+| Storage/year | 21.9 TB |
+| Incoming bandwidth | 9.7 Mb/sec |
+| Outgoing bandwidth (top-10 per keystroke) | 97 Mb/sec |
+| Servers needed (realistic peak: ~3 chars/sec/user, 3.5B users) | ~164,000 |
+
+This local build obviously runs at a tiny fraction of that scale — a handful
+of containers, not 164K servers — but every architectural lever named in the
+design doc (partitioning, caching, offline updates, replication) is the same
+lever a real deployment would pull to close that gap, just turned down. Where
+a local default stands in for a production value (batch cadence, partition
+count, prefix-length bound), it's called out explicitly rather than left to
+look like a real capacity number.
+
+## Phase log
+
+### Phase 0 — design reading and scaffolding (2026-09-20)
+
+Read all six source chapters in full. Wrote `CLAUDE.md` (architecture,
+stack/stand-in table, layout, conventions), `DESIGN.md` (8-entry decision
+register, 7-row failure-mode table, a Q&A bank answering every embedded
+question the chapters posed, open questions, and empty doc-to-code/coverage
+maps ready for Phase 1), `PROGRESS.md` (live state tracker), and this file.
+No code, no containers, nothing runnable yet — that starts in Phase 1.
+
+**Design talking points from this phase:**
+
+- The single biggest lever in this design is *moving the trie traversal off
+  the read path entirely*, not any particular data-structure trick. A
+  compressed trie is a nice constant-factor win; not traversing one per
+  request at all is the actual latency win.
+- A typeahead system is a genuinely relationship-free data problem — no
+  entities, no foreign keys, just a log, a counter table, a snapshot blob, a
+  flattened cache, and a coordination service. That absence of a relational
+  store is a real architectural signal, not a gap.
+- HDFS/Cassandra/MongoDB/ZooKeeper in the source doc map onto S3, DynamoDB,
+  S3 (again — a blob store fits a trie snapshot better than a document store
+  does), and a real ZooKeeper container respectively. Only one of those four
+  swaps (MongoDB → S3) actually changes the *kind* of store, and it's
+  motivated by an access-pattern mismatch (whole-blob write/read vs.
+  DynamoDB's item-size cap), not by "just reuse what's already in the stack."
+
+### Phase 1 — local substrate (2026-09-21)
+
+Scaffolded the solution and got every piece of infrastructure this system
+needs running and talking to each other, before writing a line of real
+suggestion/aggregation logic. `SuggestX.Contracts` picked up its first two
+DTOs (`SuggestionResponse`/`SuggestionItem` for the read path,
+`SearchEventRequest` for ingestion); `SuggestX.ServiceDefaults` got an AWS
+client factory (S3 + DynamoDB only — no SNS/SQS, since nothing in this
+system is event-driven, unlike JameX) and hosting extensions for
+health/OpenAPI/CORS/Redis. Five service projects were scaffolded
+(`Gateway`, `SuggestionService`, `CollectionService`, `Aggregator`,
+`TrieBuilder`), each currently just a health-check host — real logic starts
+Phase 2.
+
+**A real environment finding, not assumed away:** LocalStack's freemium tier
+now requires a valid auth token for license activation even for plain
+community services (S3, DynamoDB) — without one the container exits
+immediately (code 55). Fixed with a gitignored `.env`, same convention as
+the sibling JameX project, reusing that project's token since it's the same
+owner's account. A second, more interesting bug followed from copying
+JameX's `LOCALSTACK_HOST` setting without re-deriving why it had that value:
+JameX sets it to match its externally-published port because a real browser
+needs to resolve a presigned S3 URL against it. This project's ports are
+deliberately shifted (LocalStack publishes `4567` on the host, but still
+listens on `4566` inside its own container), and `LOCALSTACK_HOST` is
+actually consumed by tooling running *inside* that container — including
+the bootstrap script's own `awslocal` calls — so it needed to stay `4566`
+regardless of what the host-side port is. Copying a working pattern without
+checking whether the reason behind it still applies is exactly the mistake
+this got caught making.
+
+**Design talking point from this phase:** ports are shifted +1000 across
+the whole project (`9080`-`9084` instead of `8080`-`8084`, `6380` instead of
+`6379`, `4567` instead of `4566`) specifically so this system and JameX can
+run side by side on one machine — a small, boring decision, but one that
+matters in practice the moment a second project in the same pattern exists.
+
+### Verification (Phase 1)
+
+```bash
+dotnet build SuggestX.slnx         # 0 warnings, 0 errors
+docker compose up -d --build       # 8 containers: redis, zookeeper,
+                                    # localstack, gateway, suggestion-service,
+                                    # collection-service, aggregator,
+                                    # trie-builder
+```
+
+Confirmed live: every service answers `GET /health/live` and
+`GET /health/ready` (200). The Gateway's YARP routes proxy for real, not
+just pass a health check — confirmed by comparing a direct 404 from
+`SuggestionService` against the identical 404 arriving through
+`/api/suggestions/...`, and by reading the Gateway's own log line
+(`Proxying to http://suggestion-service:8080/...`) plus its active
+health-check probes returning 200 on both clusters. `suggestx-raw-logs`,
+`suggestx-trie-snapshots` (S3) and `suggestx-phrase-frequencies`
+(DynamoDB) all exist, confirmed via `awslocal s3 ls` /
+`awslocal dynamodb list-tables`. Redis answers `PONG`. A real ZooKeeper
+znode was created, read back exactly, and deleted via `zkCli.sh` inside the
+container — proving the coordination service genuinely works before any
+application code depends on it in Phase 4.
+
+## Next up
+
+See `PROGRESS.md` for the live, session-to-session state. The phase roadmap:
+~~local substrate~~ → Collection Service → Aggregator → trie data structure
++ Trie Builder → Suggestion Service → Gateway + frontend → evaluation extras
+(personalization, client-side optimizations, fault-tolerance verification).

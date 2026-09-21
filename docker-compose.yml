@@ -1,0 +1,169 @@
+name: suggestx
+
+# Local stand-in for the production topology in the design doc.
+#
+#   doc component                 -> service/container here
+#   -------------------------------------------------------------------
+#   Web servers / entry           -> gateway (YARP)
+#   Suggestion service            -> suggestion-service
+#   Collection service            -> collection-service   -> S3 suggestx-raw-logs
+#   Aggregator (MapReduce/HDFS)   -> aggregator            -> DynamoDB suggestx-phrase-frequencies
+#   Trie builder                  -> trie-builder          -> S3 suggestx-trie-snapshots, Redis, ZooKeeper
+#   Trie cache                    -> redis
+#   NoSQL database (Cassandra)    -> localstack DynamoDB
+#   HDFS file system              -> localstack S3 (raw logs)
+#   NoSQL doc store (MongoDB)     -> localstack S3 (trie snapshots) — see DESIGN.md §1 decision 3
+#   ZooKeeper                     -> zookeeper (real Apache ZooKeeper, not simulated)
+
+x-service-base: &service-base
+  restart: unless-stopped
+  environment: &service-env
+    ASPNETCORE_ENVIRONMENT: Development
+    ASPNETCORE_URLS: http://+:8080
+    ConnectionStrings__Redis: "redis:6379"
+    Aws__ServiceUrl: "http://localstack:4566"
+    Aws__Region: "us-east-1"
+    Aws__AccessKey: "test"
+    Aws__SecretKey: "test"
+    Storage__RawLogsBucket: "suggestx-raw-logs"
+    Storage__TrieSnapshotsBucket: "suggestx-trie-snapshots"
+    Dynamo__PhraseFrequenciesTable: "suggestx-phrase-frequencies"
+    ZooKeeper__ConnectionString: "zookeeper:2181"
+    ZooKeeper__RootPath: "/suggestx"
+  depends_on: &service-deps
+    redis:
+      condition: service_healthy
+    localstack:
+      condition: service_healthy
+    zookeeper:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------- platform
+
+  redis:
+    image: redis:7-alpine
+    container_name: suggestx-redis
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      # 6380, not Redis's default 6379 — the sibling JameX project's compose
+      # stack already claims 6379 on the host, and both are meant to be able
+      # to run side by side. Internal container-to-container traffic still
+      # uses 6379 (see ConnectionStrings__Redis below); only the host-side
+      # publish port shifts.
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  zookeeper:
+    image: zookeeper:3.9
+    container_name: suggestx-zookeeper
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD-SHELL", "zkServer.sh status | grep -E 'Mode: (standalone|leader|follower)' || exit 1"]
+      interval: 6s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  localstack:
+    image: localstack/localstack:latest
+    container_name: suggestx-localstack
+    environment:
+      SERVICES: s3,dynamodb
+      DEBUG: "0"
+      AWS_DEFAULT_REGION: us-east-1
+      # Deliberately still 4566, NOT the 4567 this container publishes on the
+      # host below. This variable is what LocalStack's own internal tooling
+      # (including the awslocal CLI the bootstrap script runs *inside* this
+      # container) uses to build its endpoint URL — and inside the container,
+      # LocalStack only ever listens on 4566; 4567 exists purely as the
+      # host-side port mapping and is invisible from in here. Unlike JameX,
+      # nothing in this system ever hands a presigned S3 URL to a browser, so
+      # there is no competing reason to make this match the external port.
+      LOCALSTACK_HOST: localhost:4566
+      # Personal credential, read from .env (gitignored) — never hardcoded
+      # here. Optional: everything else in this compose file works with it
+      # unset. Same convention as the sibling JameX project.
+      LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN:-}
+      PERSISTENCE: "1"
+    ports:
+      - "4567:4566"
+    volumes:
+      - ./infra/localstack/init:/etc/localstack/init/ready.d:ro
+      - localstack-data:/var/lib/localstack
+    healthcheck:
+      # Passes only once the bootstrap script has finished, so any service
+      # that waits for localstack to be healthy is guaranteed its table exists.
+      test: ["CMD-SHELL", "awslocal dynamodb describe-table --table-name suggestx-phrase-frequencies || exit 1"]
+      interval: 6s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  # ---------------------------------------------------------------- services
+
+  gateway:
+    <<: *service-base
+    container_name: suggestx-gateway
+    build:
+      context: .
+      dockerfile: infra/docker/Service.Dockerfile
+      args: { SERVICE: Gateway }
+    ports:
+      # 9080, not 8080 — JameX's own Gateway already publishes 8080. The
+      # whole 9080-9084 range here mirrors JameX's 8080-8084 range one-to-one
+      # shifted by 1000, purely to keep both stacks runnable at once.
+      - "9080:8080"
+    environment:
+      <<: *service-env
+      DOTNET_SYSTEM_NET_DISABLEIPV6: "1"
+      ReverseProxy__Clusters__suggestionService__Destinations__container__Address: "http://suggestion-service:8080/"
+      ReverseProxy__Clusters__collectionService__Destinations__container__Address: "http://collection-service:8080/"
+
+  suggestion-service:
+    <<: *service-base
+    container_name: suggestx-suggestion-service
+    build:
+      context: .
+      dockerfile: infra/docker/Service.Dockerfile
+      args: { SERVICE: SuggestionService }
+    ports:
+      - "9081:8080"
+
+  collection-service:
+    <<: *service-base
+    container_name: suggestx-collection-service
+    build:
+      context: .
+      dockerfile: infra/docker/Service.Dockerfile
+      args: { SERVICE: CollectionService }
+    ports:
+      - "9082:8080"
+
+  aggregator:
+    <<: *service-base
+    container_name: suggestx-aggregator
+    build:
+      context: .
+      dockerfile: infra/docker/Service.Dockerfile
+      args: { SERVICE: Aggregator }
+    ports:
+      - "9083:8080"
+
+  trie-builder:
+    <<: *service-base
+    container_name: suggestx-trie-builder
+    build:
+      context: .
+      dockerfile: infra/docker/Service.Dockerfile
+      args: { SERVICE: TrieBuilder }
+    ports:
+      - "9084:8080"
+
+volumes:
+  localstack-data:
