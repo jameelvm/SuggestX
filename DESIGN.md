@@ -2,9 +2,9 @@
 
 Companion to `README.md`. README explains *how* the system was built, phase by
 phase; this file explains *why it is shaped this way* — every non-obvious
-choice, every failure mode it was built to survive, and the interview-style
-questions the design doc itself poses (each chapter ends with one or more
-"show answer" prompts — answered here, against this build, not abstractly).
+choice, every failure mode it was built to survive, and the questions the
+design doc itself poses (each chapter ends with one or more "show answer"
+prompts — answered here, against this build, not abstractly).
 
 ## §0 Source material
 
@@ -57,9 +57,9 @@ considered, and why this one won.
    cover the "which version is current" need, but it would erase a distinct
    architectural concept the doc explicitly names — a coordination/config
    service separate from the cache — and this project's stated goal is
-   interview preparation through implementation, which means the concept
-   deserves a real running instance and a real client library, not a
-   shortcut. ZooKeeper owns two things: the partition map
+   understanding through implementation, which means the concept deserves a
+   real running instance and a real client library, not a shortcut.
+   ZooKeeper owns two things: the partition map
    (`/suggestx/partitions`) and, per partition, a `current_version` znode
    that `TrieBuilder` flips atomically after a successful cutover.
 

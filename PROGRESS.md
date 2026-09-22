@@ -141,6 +141,21 @@ Ordered. Each phase leaves the build green **and** updates `README.md` and
 
 ## Environment notes
 
+- **Interview-prep framing removed from CLAUDE.md/DESIGN.md/README.md
+  (2026-09-21, at the owner's request)** — this should read as an
+  application's own documentation, not as interview-study material.
+  Removed: "the goal is interview preparation through implementation" (both
+  places it appeared, CLAUDE.md and DESIGN.md — reworded to "understanding
+  through implementation"), "preparing for a system design interview" from
+  CLAUDE.md's Owner context, and "interview-style questions" from DESIGN.md's
+  intro (now just "the questions the design doc itself poses"). Kept, as a
+  factual citation rather than framing: the literal name of the source
+  material, *Grokking Modern System Design Interview*, wherever the docs
+  reference which book/course chapters this build is internalising — that's
+  naming a source, not describing a goal. Same distinction JameX drew in its
+  own phase 7 (see that project's PROGRESS.md), except carried further here
+  at the owner's explicit request — JameX left its own CLAUDE.md untouched by
+  that reframing; this project's CLAUDE.md was included.
 - **The project was renamed `Typeahead` → `SuggestX` (2026-09-21, at the
   owner's request)**, mirroring JameX's own pattern of a whimsical project
   name distinct from the topic folder (`TypeheadSuggestion/` — unrenamed,

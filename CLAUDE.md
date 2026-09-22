@@ -2,9 +2,8 @@
 
 A working typeahead/autocomplete system built to internalise the system design in
 `../*.pdf` (Grokking Modern System Design Interview — Typeahead Suggestion
-System chapters, 1–6). The goal is **interview preparation through
-implementation**: every component in the design doc has a real, runnable
-counterpart here.
+System chapters, 1–6). The goal is **understanding through implementation**:
+every component in the design doc has a real, runnable counterpart here.
 
 ## Read this first
 
@@ -21,10 +20,10 @@ counterpart here.
 ## Owner context
 
 The author is a C#/.NET developer with AWS, PostgreSQL and DynamoDB experience,
-preparing for a system design interview, and has already built a companion
-project (`JameX`, a YouTube clone) using this exact pattern. Prefer idiomatic
-.NET and real AWS service APIs over bespoke abstractions — the code should
-double as an answer to "how would you actually build this on AWS?".
+and has already built a companion project (`JameX`, a YouTube clone) using
+this exact pattern. Prefer idiomatic .NET and real AWS service APIs over
+bespoke abstractions — the code should double as an answer to "how would you
+actually build this on AWS?".
 
 ## What this system actually is
 
