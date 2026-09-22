@@ -1,16 +1,18 @@
+using SuggestX.CollectionService;
 using SuggestX.ServiceDefaults.Hosting;
 
 // Owns suggestx-raw-logs (S3) exclusively — the doc's "collection service"
-// / HDFS write path. Once Phase 2 fills this in: buffers submitted search
-// events in memory per instance and flushes them as line-delimited JSON
-// objects on a timer, so concurrent instances never contend on the same S3
-// key. Module 1 only proves the process starts and answers a health check.
+// / HDFS write path. Module 1 (this): POST /search-events buffers submitted
+// search events in memory, per instance. Module 2 adds the timed flush to
+// S3 as line-delimited JSON, keyed per instance so concurrent instances
+// never contend on the same object.
 const string ServiceName = "CollectionService";
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.AddSuggestXServiceDefaults(ServiceName);
 builder.AddSuggestXApiDefaults();
+builder.Services.AddCollectionServices();
 
 var app = builder.Build();
 

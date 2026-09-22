@@ -205,7 +205,7 @@ build specifically (not left abstract).
 | Doc concept | Chapter | File(s) | Why this choice |
 |---|---|---|---|
 | Suggestion service | 3, 5 | `src/services/SuggestX.SuggestionService/` | Scaffolded, health-check only so far; real Redis-`GET` read path arrives Phase 5. |
-| Collection service | 5 | `src/services/SuggestX.CollectionService/` | Scaffolded; S3 batch-flush logic arrives Phase 2. |
+| Collection service | 5 | `src/services/SuggestX.CollectionService/` | `POST /search-events` + in-memory `ISearchEventBuffer` live (Phase 2 Module 1). S3 batch-flush arrives Module 2. |
 | Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | Scaffolded as an API host for health/status now; the real `BackgroundService` batch worker arrives Phase 3. |
 | Trie builder | 5 | `src/services/SuggestX.TrieBuilder/` | Scaffolded; the compressed trie + blue/green swap arrives Phase 4. |
 | Web servers / entry point | 3 | `src/services/SuggestX.Gateway/` | YARP proxy, two routes (`/api/suggestions`, `/api/search-events`) live; no auth layer, since the source doc has no identity concept at all. |

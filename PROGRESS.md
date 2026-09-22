@@ -35,6 +35,8 @@ state* and *Next up* sections at the end of every session.
 
 **Last updated:** 2026-09-21
 **Phase 1 — local substrate. Complete, verified.**
+**Phase 2 — Collection Service. Module 1 (`POST /search-events` + buffer)
+complete, verified. Module 2 (S3 flush) next.**
 
 Read all six source PDFs in full (`../*.pdf` — overview, requirements,
 high-level design, data structure/trie, detailed design, evaluation).
@@ -95,14 +97,32 @@ correct, not an oversight.
 
 ### In progress
 
-Nothing — awaiting go-ahead to start Phase 2 (Collection Service).
+**Phase 2 — Collection Service.**
+
+- [x] **Module 1 — `POST /search-events` + in-memory buffer.**
+      `ISearchEventBuffer`/`SearchEventBuffer` (`Services/`) wraps a
+      `ConcurrentQueue<BufferedSearchEvent>` — `Enqueue` from the controller,
+      `DrainAll` reserved for Module 2's flush timer, `Count` backing a debug
+      endpoint. `BufferedSearchEvent` (`Domain/`) assigns `ReceivedAt`
+      server-side at receipt time — never trusts a client-supplied
+      timestamp. `SearchEventsController` (`Api/`) exposes `POST
+      /search-events` (rejects a blank/whitespace-only query with 400,
+      otherwise 202 Accepted — "accepted" means buffered, not yet durable)
+      and a dev-only `GET /search-events/_debug/count`.
+
+      **Verified against the live stack, including through the Gateway**:
+      count started at 0; two direct `POST`s brought it to 2; a
+      whitespace-only query was rejected with 400 and did **not** increment
+      the count; a `POST` through `http://localhost:9080/api/search-events`
+      (the Gateway's proxy route) brought the count to 3 — confirming the
+      full path from the public route down to the buffer, not just the
+      controller in isolation. Container logs clean, `/health/live` and
+      `/health/ready` both still green after the change.
 
 ### Next up (immediate)
 
-**Phase 2 — Collection Service.** Proposed module breakdown:
+**Phase 2 — Collection Service**, continued:
 
-1. `POST /search-events` accepting `SearchEventRequest`, in-memory
-   per-instance buffer.
 2. Timed flush to `suggestx-raw-logs` as a line-delimited JSON object,
    keyed so concurrent instances never contend on the same S3 key (e.g.
    `{instanceId}/{flushTimestamp}.jsonl`).
