@@ -1,9 +1,9 @@
 # SuggestX
 
 A working typeahead/autocomplete system built to internalise the system design in
-`../*.pdf` (Grokking Modern System Design Interview — Typeahead Suggestion
-System chapters, 1–6). The goal is **understanding through implementation**:
-every component in the design doc has a real, runnable counterpart here.
+`../*.pdf` (the "Typeahead Suggestion System" chapters, 1–6). The goal is
+**understanding through implementation**: every component in the design doc
+has a real, runnable counterpart here.
 
 ## Read this first
 

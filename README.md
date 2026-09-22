@@ -1,8 +1,8 @@
 # SuggestX
 
-A working typeahead/autocomplete system, built end to end to internalise
-*Grokking Modern System Design Interview*'s "Typeahead Suggestion System"
-chapters. This document is revision material — it explains what was built,
+A working typeahead/autocomplete system, built end to end to internalise the
+"Typeahead Suggestion System" design chapters in `../*.pdf`. This document is
+revision material — it explains what was built,
 why, and how to see it working — updated at the end of every phase, not a
 running change log. For the decision-by-decision reasoning and the
 failure-mode/Q&A material, see `DESIGN.md`. For live build state, see

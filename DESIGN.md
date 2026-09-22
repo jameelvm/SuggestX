@@ -8,10 +8,10 @@ prompts — answered here, against this build, not abstractly).
 
 ## §0 Source material
 
-`../*.pdf` — Grokking Modern System Design Interview, "Typeahead Suggestion
-System," six chapters: overview, requirements, high-level design, data
-structure (trie), detailed design (suggestion service + assembler),
-evaluation. Read in full 2026-09-17 before any scaffolding was written.
+`../*.pdf` — the "Typeahead Suggestion System" design chapters, six in total:
+overview, requirements, high-level design, data structure (trie), detailed
+design (suggestion service + assembler), evaluation. Read in full
+2026-09-17 before any scaffolding was written.
 
 ## §1 Decision register
 
