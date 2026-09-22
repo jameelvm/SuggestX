@@ -193,9 +193,48 @@ znode was created, read back exactly, and deleted via `zkCli.sh` inside the
 container — proving the coordination service genuinely works before any
 application code depends on it in Phase 4.
 
+### Phase 2 — Collection Service (2026-09-22)
+
+Built the first real piece of the pipeline: the write path that turns a
+user's search into durable evidence. `POST /search-events` validates and
+buffers a submitted search term in memory (`ISearchEventBuffer`); a
+`BackgroundService` (`SearchEventFlushWorker`) drains that buffer on a timer
+and writes it as one line-delimited-JSON object to `suggestx-raw-logs`,
+skipping the write entirely when there's nothing to flush.
+
+**Two things worth calling out, not just "it flushes to S3":**
+
+- **The object key is designed for Aggregator before Aggregator exists.**
+  Each key is `{millisecond-timestamp}-{instance-guid}.jsonl` — timestamp
+  first, so keys sort chronologically and Phase 3's Aggregator can use S3's
+  `ListObjectsV2` with `StartAfter` to find only new objects, instead of
+  reading every object in the bucket to discover which ones are recent. The
+  GUID suffix means two instances (or the same instance flushing twice in
+  the same millisecond) can never collide.
+- **Graceful shutdown flushes what's left; an ungraceful kill doesn't.**
+  `StopAsync` is overridden to run one last flush before the process exits
+  on a clean SIGTERM. Verified by posting an event and then
+  `docker compose stop`-ping the container mid-interval: the log showed
+  `Application is shutting down...` immediately followed by the flush
+  completing, and the event landed in S3. What this *doesn't* cover — a
+  SIGKILL or crash — is written up honestly in `DESIGN.md`'s failure-mode
+  table and open questions, not glossed over: closing that gap needs a
+  write-ahead durability layer, a different ingest architecture, not a
+  patch to the current buffer.
+
+**Verified against the live stack, step by step, not just "it compiled":**
+the debug count endpoint went 0 → 2 (two direct posts) → unchanged after a
+rejected blank query → 3 after one more posted through the Gateway's real
+proxy route. Three events landed in one S3 object after a flush cycle, with
+every field correct on inspection; a second flush cycle produced a second,
+distinct object rather than overwriting the first; an idle interval produced
+no object at all; the shutdown-flush test above produced a third object
+containing exactly the one event that was in flight.
+
 ## Next up
 
 See `PROGRESS.md` for the live, session-to-session state. The phase roadmap:
-~~local substrate~~ → Collection Service → Aggregator → trie data structure
-+ Trie Builder → Suggestion Service → Gateway + frontend → evaluation extras
-(personalization, client-side optimizations, fault-tolerance verification).
+~~local substrate~~ → ~~Collection Service~~ → Aggregator → trie data
+structure + Trie Builder → Suggestion Service → Gateway + frontend →
+evaluation extras (personalization, client-side optimizations,
+fault-tolerance verification).

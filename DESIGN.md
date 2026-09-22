@@ -100,6 +100,23 @@ considered, and why this one won.
    worth of Redis memory briefly) is cheap at local/demo scale and cheap in
    real deployments too, relative to the cost of a read-path outage.
 
+9. **A failed S3 flush is logged and dropped, not retried — and an
+   ungraceful `CollectionService` kill can still lose buffered events.**
+   Phase 0's failure-mode table originally predicted "a bounded retry before
+   drop"; Phase 2 built something simpler on purpose. A retry loop inside
+   the flush worker risks the *next* timer tick firing while a retry of the
+   *previous* one is still in flight, double-buffering complexity for a
+   pipeline whose own stated design already accepts imperfect accuracy (see
+   decision 2's framing: undercounting a trend is tolerable, corrupting one
+   is not). The harder gap — an ungraceful kill (SIGKILL, OOM, a crashed
+   process) loses whatever's in memory since the last successful flush,
+   because `StopAsync`'s graceful-shutdown flush only ever runs on a clean
+   SIGTERM — is left open rather than papered over. Closing it for real
+   needs a write-ahead durability layer (e.g., acking the client only after
+   an append to a local file or a durable queue), which is a genuinely
+   different architecture for the ingest path, not a small addition; noted
+   as an open question (§4) instead of quietly built around.
+
 ## §2 Failure-mode table
 
 | Failure | Effect without mitigation | Mitigation in this build |
@@ -109,7 +126,8 @@ considered, and why this one won.
 | ZooKeeper unreachable | `SuggestionService` cannot learn the current version | Suggestion Service caches the last-known version/partition map in memory and continues serving it; a ZooKeeper outage degrades to "suggestions may go stale," not "suggestions stop." |
 | A Redis partition is unreachable | Every query for that prefix range fails | Redis's own primary-replica replication (not hand-rolled app failover) is the mitigation — matches how a real deployment would actually solve this, rather than inventing bespoke failover code. |
 | A hot prefix range gets disproportionate load (e.g., everything starting "S") | One partition's servers overload while others idle | Named directly in the source doc as range partitioning's real weakness. Left as an open, unsolved question here (see §4) rather than hidden — a hash-based secondary partitioning layer is the real answer and is out of scope for this build. |
-| S3 raw-log write fails from `CollectionService` | A user's search event is lost, undercounting a real trend | In-memory buffer with a bounded retry before drop; documented as best-effort, matching the doc's own framing that offline aggregation trades perfect accuracy for read-path speed. |
+| S3 raw-log write fails from `CollectionService` | A user's search event is lost, undercounting a real trend | `SearchEventFlushWorker` logs and drops the batch rather than retrying — see decision 9 for why no retry was built, even though row-112's original prediction (Phase 0) assumed one. |
+| `CollectionService` is killed ungracefully (SIGKILL, crash, OOM) between flush cycles | Whatever's in the in-memory buffer since the last successful flush is lost — the graceful-shutdown flush (`StopAsync`) only runs on a clean SIGTERM, never on a hard kill | Not mitigated. A genuine, acknowledged gap: closing it needs a write-ahead durability layer (e.g., append to a local file or a queue before acking the client), which this build deliberately doesn't add — see decision 9. |
 | `SuggestionService` instance restarts | Cold start with no cached version/partition map | Reads current state from ZooKeeper on startup before serving; documented startup-ordering dependency (ZooKeeper must be reachable at boot, even though it's not required per-request after that). |
 
 ## §3 Q&A bank
@@ -199,13 +217,18 @@ build specifically (not left abstract).
   question, not a requirement; not built.
 - **Personalization** — designed above, not yet built; tracked as a later
   phase in `PROGRESS.md`.
+- **CollectionService has no write-ahead durability** — an ungraceful kill
+  between flush cycles loses buffered events (decision 9). A real fix needs
+  a different ingest architecture (durable queue or local write-ahead log
+  before acking the client), not a patch to the current in-memory buffer;
+  out of scope for this build.
 
 ## §5 Doc-to-code map
 
 | Doc concept | Chapter | File(s) | Why this choice |
 |---|---|---|---|
 | Suggestion service | 3, 5 | `src/services/SuggestX.SuggestionService/` | Scaffolded, health-check only so far; real Redis-`GET` read path arrives Phase 5. |
-| Collection service | 5 | `src/services/SuggestX.CollectionService/` | `POST /search-events` + in-memory `ISearchEventBuffer` live (Phase 2 Module 1). S3 batch-flush arrives Module 2. |
+| Collection service | 5 | `src/services/SuggestX.CollectionService/` | `POST /search-events` buffers in memory; `SearchEventFlushWorker` drains it on a timer (and on graceful shutdown) to `suggestx-raw-logs` as line-delimited JSON, keyed to sort chronologically and never collide across instances. Phase 2, complete. |
 | Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | Scaffolded as an API host for health/status now; the real `BackgroundService` batch worker arrives Phase 3. |
 | Trie builder | 5 | `src/services/SuggestX.TrieBuilder/` | Scaffolded; the compressed trie + blue/green swap arrives Phase 4. |
 | Web servers / entry point | 3 | `src/services/SuggestX.Gateway/` | YARP proxy, two routes (`/api/suggestions`, `/api/search-events`) live; no auth layer, since the source doc has no identity concept at all. |
@@ -222,7 +245,7 @@ build specifically (not left abstract).
 | Compressed trie | ⬜ Designed, not built |
 | Trie partitioning by prefix range | ⬜ Designed, not built |
 | Offline trie updates (MapReduce-style) | ⬜ Designed, not built |
-| Collection service | ⬜ Designed, not built |
+| Collection service | ✅ Built and verified (Phase 2) |
 | Aggregator | ⬜ Designed, not built |
 | Trie builder + ZooKeeper-coordinated swap | ⬜ Designed, not built |
 | Suggestion service (Redis-backed) | ⬜ Designed, not built |

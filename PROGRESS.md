@@ -5,7 +5,7 @@
 Say this to Claude at the start of the next session:
 
 > Read PROGRESS.md and CLAUDE.md in C:\System Design\TypeheadSuggestion\App,
-> then start Phase 2 — Collection Service. Build it in short modules, pausing
+> then start Phase 3 — Aggregator. Build it in short modules, pausing
 > after each one so I can review before you continue.
 
 **Build in short modules.** One concept per module, verified and explained
@@ -33,10 +33,9 @@ state* and *Next up* sections at the end of every session.
 
 ## Current state
 
-**Last updated:** 2026-09-21
+**Last updated:** 2026-09-22
 **Phase 1 — local substrate. Complete, verified.**
-**Phase 2 — Collection Service. Module 1 (`POST /search-events` + buffer)
-complete, verified. Module 2 (S3 flush) next.**
+**Phase 2 — Collection Service. Complete, verified.**
 
 Read all six source PDFs in full (`../*.pdf` — overview, requirements,
 high-level design, data structure/trie, detailed design, evaluation).
@@ -94,40 +93,82 @@ correct, not an oversight.
 - [x] **Phase 1 — local substrate.** Solution scaffold, all 5 services
       containerised and healthy, docker-compose + LocalStack + Redis + real
       ZooKeeper verified live end to end. Full detail in "Current state" above.
+- [x] **Phase 2 — Collection Service.** Delivered as two modules:
 
-### In progress
-
-**Phase 2 — Collection Service.**
-
-- [x] **Module 1 — `POST /search-events` + in-memory buffer.**
-      `ISearchEventBuffer`/`SearchEventBuffer` (`Services/`) wraps a
-      `ConcurrentQueue<BufferedSearchEvent>` — `Enqueue` from the controller,
-      `DrainAll` reserved for Module 2's flush timer, `Count` backing a debug
-      endpoint. `BufferedSearchEvent` (`Domain/`) assigns `ReceivedAt`
-      server-side at receipt time — never trusts a client-supplied
-      timestamp. `SearchEventsController` (`Api/`) exposes `POST
-      /search-events` (rejects a blank/whitespace-only query with 400,
-      otherwise 202 Accepted — "accepted" means buffered, not yet durable)
-      and a dev-only `GET /search-events/_debug/count`.
+      1. **`POST /search-events` + in-memory buffer.**
+         `ISearchEventBuffer`/`SearchEventBuffer` (`Services/`) wraps a
+         `ConcurrentQueue<BufferedSearchEvent>` — `Enqueue` from the
+         controller, `DrainAll` for the flush worker, `Count` backing a
+         debug endpoint. `BufferedSearchEvent` (`Domain/`) assigns
+         `ReceivedAt` server-side at receipt time — never trusts a
+         client-supplied timestamp. `SearchEventsController` (`Api/`)
+         exposes `POST /search-events` (rejects a blank/whitespace-only
+         query with 400, otherwise 202 Accepted — "accepted" means
+         buffered, not yet durable) and a dev-only
+         `GET /search-events/_debug/count`.
+      2. **Timed flush to S3 + graceful-shutdown flush.**
+         `SearchEventFlushWorker` (`Jobs/`, a `BackgroundService`) drains
+         the buffer on a `PeriodicTimer` (`Collection:FlushIntervalSeconds`,
+         default 10s — demo-scale, not a production claim) and writes it as
+         one line-delimited-JSON object to `suggestx-raw-logs`, skipping
+         the write entirely when the buffer is empty. Each object's key is
+         `{yyyyMMddHHmmssfff}-{instanceId}.jsonl` — millisecond timestamp
+         prefix first so keys sort chronologically (Aggregator, Phase 3,
+         can use S3's `ListObjectsV2` `StartAfter` instead of reading every
+         object to find new ones), a per-process GUID suffix so two
+         instances can never collide even flushing at the same millisecond.
+         `StopAsync` is overridden to flush one last time on graceful
+         shutdown, so a container restart between timer ticks can't
+         silently drop buffered events. A failed S3 write is logged and
+         swallowed, not rethrown — matching the pipeline's documented
+         best-effort framing (a dropped batch undercounts a trend, never
+         corrupts one) and, just as important, so a transient S3 blip can't
+         crash the flush loop and take every *subsequent* batch down with
+         it. The line format is `SearchLogEntry` (`SuggestX.Contracts`, not
+         internal to CollectionService) — Aggregator is the other side of
+         this exact wire format, so it's a real cross-service contract, not
+         a local implementation detail.
 
       **Verified against the live stack, including through the Gateway**:
       count started at 0; two direct `POST`s brought it to 2; a
-      whitespace-only query was rejected with 400 and did **not** increment
-      the count; a `POST` through `http://localhost:9080/api/search-events`
-      (the Gateway's proxy route) brought the count to 3 — confirming the
-      full path from the public route down to the buffer, not just the
-      controller in isolation. Container logs clean, `/health/live` and
-      `/health/ready` both still green after the change.
+      whitespace-only query was rejected with 400 and did not increment the
+      count; a `POST` through `http://localhost:9080/api/search-events`
+      (the Gateway's route) brought the count to 3 — confirming the full
+      path from the public route to the buffer, not just the controller in
+      isolation. Three posted events appeared in S3 after one flush cycle
+      with exactly the right content (`awslocal s3 cp ... -`, inspected
+      line by line) and the buffer count dropped back to 0; a second flush
+      cycle produced a second, distinct key rather than overwriting the
+      first; an idle interval with nothing posted produced **no** new
+      object (empty-buffer skip confirmed); posting one event and then
+      `docker compose stop`-ping the container mid-interval produced a
+      *third* object containing that exact event, with the container log
+      showing `Application is shutting down...` immediately followed by the
+      flush completing — proving the graceful-shutdown path actually
+      prevents data loss, not just that the code compiles.
+
+### In progress
+
+Nothing — awaiting go-ahead to start Phase 3 (Aggregator).
 
 ### Next up (immediate)
 
-**Phase 2 — Collection Service**, continued:
+**Phase 3 — Aggregator.** Proposed module breakdown (to confirm/adjust with
+the owner before starting):
 
-2. Timed flush to `suggestx-raw-logs` as a line-delimited JSON object,
-   keyed so concurrent instances never contend on the same S3 key (e.g.
-   `{instanceId}/{flushTimestamp}.jsonl`).
-3. Verify: post real events, confirm they land in S3 (`awslocal s3 cp`/`ls`),
-   confirm two instances (or two rapid flush cycles) never collide on a key.
+1. A `BackgroundService` reading new objects from `suggestx-raw-logs`
+   (read-only) since the last checkpoint, using the sortable key prefix
+   `SearchEventFlushWorker` already writes to list only what's new via
+   `ListObjectsV2`'s `StartAfter`.
+2. An in-process map-reduce over each batch's phrases, atomically `ADD`ing
+   counts into `suggestx-phrase-frequencies` (DynamoDB) — never a plain
+   `PutItem`, so a redelivered/reprocessed batch increments rather than
+   resets a real count.
+3. Checkpoint persistence (which key was last processed) so a restart
+   resumes instead of reprocessing everything from the start of the bucket.
+4. Verify: post real search events, let Aggregator's cycle run, confirm
+   DynamoDB counts increment correctly; re-run the same batch and confirm
+   idempotency; verify a restart resumes from the checkpoint, not from zero.
 
 ---
 
@@ -139,8 +180,8 @@ Ordered. Each phase leaves the build green **and** updates `README.md` and
 1. ~~Local substrate~~ — done. Docker Compose, LocalStack (S3 + DynamoDB),
    real Redis, real ZooKeeper, solution scaffold, all 5 services
    containerised and health-checked.
-2. **Collection Service** — ingest search events, batch-flush to S3. Not
-   started.
+2. ~~Collection Service~~ — done. `POST /search-events` + buffer, timed
+   flush to S3, graceful-shutdown flush, all verified live.
 3. **Aggregator** — S3 raw logs → DynamoDB frequency table, checkpointed
    batch worker. Not started.
 4. **Trie data structure + Trie Builder** — compressed trie in memory, top-N
