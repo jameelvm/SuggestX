@@ -33,9 +33,14 @@ state* and *Next up* sections at the end of every session.
 
 ## Current state
 
-**Last updated:** 2026-09-22
+**Last updated:** 2026-09-23
 **Phase 1 — local substrate. Complete, verified.**
 **Phase 2 — Collection Service. Complete, verified.**
+**Local debugging (cross-cutting, not a phase) — set up and verified.**
+Every service can now run under the Visual Studio debugger, on the exact
+port its container publishes, with the Gateway automatically reaching
+whichever one (container or local) is actually running. Full detail below;
+guide lives in `DEBUGGING.md`.
 
 Read all six source PDFs in full (`../*.pdf` — overview, requirements,
 high-level design, data structure/trie, detailed design, evaluation).
@@ -146,6 +151,65 @@ correct, not an oversight.
       showing `Application is shutting down...` immediately followed by the
       flush completing — proving the graceful-shutdown path actually
       prevents data loss, not just that the code compiles.
+- [x] **Local debugging setup (cross-cutting tooling, at the owner's
+      request).** Every service got a `Properties/launchSettings.json` with
+      a `"{Service} (local)"` profile bound to the *same* port number its
+      container publishes (9080 Gateway, 9081 SuggestionService, 9082
+      CollectionService, 9083 Aggregator, 9084 TrieBuilder) — deliberately
+      not a separate port range like the sibling JameX project uses, since
+      the requested workflow is "stop the container, run the same service
+      locally on the port it just freed," which only makes sense if they
+      share one port. The Gateway (`suggestx-host:host-gateway` alias,
+      mirroring JameX's `jamex-host`) reaches whichever process — container
+      or local debugger — is currently bound to that port on the host, with
+      no configuration to toggle.
+
+      **A real design correction made during verification, not before it:**
+      the first version copied JameX's two-destination failover pattern
+      (`container` + `local` entries, `FirstAlphabetical` load balancing to
+      prefer the container). Testing it live showed the Gateway picking
+      between the two destinations inconsistently even while both were
+      healthy — never *incorrectly* (both labels always resolved to the
+      same actual backend whenever the container was running, since Docker's
+      own port-forward answers the host-route address too), but impossible
+      to honestly document as deterministic. Root-caused to the fact that
+      same-numbered ports make the two destinations structurally
+      interchangeable whenever the container is up, which the dual-port
+      JameX pattern never has to deal with. Fixed by simplifying to **one**
+      destination per cluster, always reached via the host-gateway route —
+      removes the ambiguity entirely rather than explaining around it.
+      Recorded as `DESIGN.md` decision 10.
+
+      **A second real bug, found by the verification itself, not despite
+      it:** the first attempt at verifying the container→local→container
+      round trip used `kill <pid>` on the `dotnet run` wrapper process to
+      "stop" the local instance between states. `dotnet run` launches the
+      compiled executable as a *child* process; killing the wrapper does
+      not kill the child on Windows. Every subsequent test in that first
+      pass — including the ones that appeared to prove the failover worked
+      in both directions — was actually being served by that orphaned,
+      never-truly-stopped child the entire time, not by whatever was
+      supposedly being tested. Caught by noticing `docker compose ps`
+      showed the container as **not running** during a test that was
+      nonetheless returning successful responses. Fixed by finding the
+      real listening PID via `netstat -ano | grep :PORT` /
+      `Get-NetTCPConnection` before each kill, not trusting the launcher's
+      own PID, and redoing every verification from a confirmed-clean state.
+
+      **Verified against the live stack, honestly this time** (see
+      `DEBUGGING.md`'s own "Verified" section for the full blow-by-blow):
+      container-only → Gateway reaches the container, confirmed via its
+      own buffered-event count incrementing; container stopped, local
+      running → Gateway reaches the local process, confirmed the same way
+      while `docker compose ps` showed the container absent; local killed
+      (correct PID this time) and container restarted → Gateway reaches the
+      container again, confirmed via a *fresh* buffered count on the
+      restarted container; a local start attempted while the container
+      still held the port failed to bind, exactly as designed, and left the
+      container completely unaffected. Repeated for both Gateway-routed
+      services (SuggestionService, CollectionService) — Aggregator and
+      TrieBuilder have `launchSettings.json` profiles too but no Gateway
+      route to verify through yet (Phase 6).
 
 ### In progress
 
@@ -202,6 +266,26 @@ Ordered. Each phase leaves the build green **and** updates `README.md` and
 
 ## Environment notes
 
+- **`dotnet run` launches the compiled executable as a child process — killing
+  the wrapper doesn't kill the child, on Windows.** Cost a full round of
+  local-debugging verification (see the Phase 2 entry above): `kill <wrapper
+  pid>` left the actual `SuggestX.*.exe` still bound to its port, silently
+  answering every subsequent "test" regardless of what was supposedly being
+  exercised. **When you need to reliably stop a locally-run service, find
+  the PID actually listening on its port** (`netstat -ano | grep :PORT` in
+  Git Bash, or `Get-NetTCPConnection -LocalPort PORT` in PowerShell) and
+  stop *that* PID — never assume the launcher's own PID covers it. A
+  container that's supposedly involved in a test not showing up in
+  `docker compose ps` while requests still succeed is the tell that
+  something else is answering instead.
+- **When running a service's compiled DLL directly (`dotnet path/to.dll`)
+  instead of via `dotnet run`, the content root becomes the shell's current
+  directory, not the project folder** — so `appsettings.json` sitting next
+  to the DLL is silently not found, and every config value that isn't set
+  another way comes back empty. Surfaced as a confusing AWS-credential
+  resolution failure with no obvious link to the real cause. Always debug
+  locally via `dotnet run --project <path> --launch-profile "<name>"` (or
+  F5 in Visual Studio), never by invoking the built DLL directly.
 - **Interview-prep framing removed from CLAUDE.md/DESIGN.md/README.md
   (2026-09-21, at the owner's request)** — this should read as an
   application's own documentation, not as interview-study material. Two

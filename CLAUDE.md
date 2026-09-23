@@ -16,6 +16,8 @@ has a real, runnable counterpart here.
   table, Q&A bank and a doc-to-code coverage map. **Extend it at the end of
   every phase.** README explains *how* it was built; DESIGN explains *why it is
   shaped this way*.
+- **`DEBUGGING.md`** — how to run any service under the Visual Studio
+  debugger alongside the rest of the stack in Docker.
 
 ## Owner context
 
@@ -131,6 +133,7 @@ App/
 ├── PROGRESS.md           # session state — read and update every session
 ├── README.md             # end-to-end teaching docs, updated every phase
 ├── DESIGN.md             # decision register, failure-mode table, Q&A bank
+├── DEBUGGING.md          # running a service locally alongside its container
 ├── docker-compose.yml
 ├── .env                  # LOCALSTACK_AUTH_TOKEN — gitignored, personal
 ├── infra/
@@ -141,10 +144,10 @@ App/
 │   │   ├── SuggestX.Contracts/       # DTOs; no infrastructure deps
 │   │   └── SuggestX.ServiceDefaults/ # AWS clients, Redis, health (ZooKeeper client lands with TrieBuilder, Phase 4)
 │   └── services/
-│       ├── SuggestX.Gateway/
-│       ├── SuggestX.SuggestionService/
-│       ├── SuggestX.CollectionService/
-│       ├── SuggestX.Aggregator/
+│       ├── SuggestX.Gateway/            # each has Properties/launchSettings.json
+│       ├── SuggestX.SuggestionService/  # with a "{Service} (local)" profile on
+│       ├── SuggestX.CollectionService/  # the same port its container publishes
+│       ├── SuggestX.Aggregator/         # — see DEBUGGING.md
 │       └── SuggestX.TrieBuilder/
 └── web/                  # Next.js frontend
 ```

@@ -119,11 +119,28 @@ services:
       # whole 9080-9084 range here mirrors JameX's 8080-8084 range one-to-one
       # shifted by 1000, purely to keep both stacks runnable at once.
       - "9080:8080"
+    # Lets the container reach a service you start in Visual Studio on the
+    # host. host-gateway is the host's own address, resolved by Docker
+    # Desktop — works the same way JameX's jamex-host alias does.
+    extra_hosts:
+      - "suggestx-host:host-gateway"
     environment:
       <<: *service-env
+      # Docker Desktop publishes BOTH an IPv4 and an IPv6 record for a host
+      # alias. .NET tries IPv6 first, there is no IPv6 route to the host, and
+      # every probe fails with "Network is unreachable" — reads like the
+      # service is down rather than like a networking problem. Disabling
+      # IPv6 makes this container use the IPv4 record it can actually reach.
       DOTNET_SYSTEM_NET_DISABLEIPV6: "1"
-      ReverseProxy__Clusters__suggestionService__Destinations__container__Address: "http://suggestion-service:8080/"
-      ReverseProxy__Clusters__collectionService__Destinations__container__Address: "http://collection-service:8080/"
+      # One destination per cluster, always routed via the host (suggestx-host,
+      # the alias above) rather than Docker's direct container-to-container
+      # DNS. Whatever is actually bound to that port on the host — the
+      # container's own published port, or your Visual Studio debugger once
+      # the container is stopped — answers either way; see appsettings.json's
+      # Clusters comment and DEBUGGING.md for why this is one address, not
+      # the usual two-destination failover pattern.
+      ReverseProxy__Clusters__suggestionService__Destinations__instance__Address: "http://suggestx-host:9081/"
+      ReverseProxy__Clusters__collectionService__Destinations__instance__Address: "http://suggestx-host:9082/"
 
   suggestion-service:
     <<: *service-base

@@ -1,12 +1,17 @@
 {
+  "$schema": "https://json.schemastore.org/launchsettings.json",
   "profiles": {
-    "SuggestX.CollectionService": {
+    // Same port the container publishes (9082) — stop the container first,
+    // or this fails to bind. See DEBUGGING.md.
+    "CollectionService (local)": {
       "commandName": "Project",
+      "dotnetRunMessages": true,
       "launchBrowser": true,
+      "launchUrl": "scalar",
+      "applicationUrl": "http://localhost:9082",
       "environmentVariables": {
         "ASPNETCORE_ENVIRONMENT": "Development"
-      },
-      "applicationUrl": "https://localhost:59451;http://localhost:59454"
+      }
     }
   }
 }

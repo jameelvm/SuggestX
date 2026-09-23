@@ -1,12 +1,17 @@
 {
+  "$schema": "https://json.schemastore.org/launchsettings.json",
   "profiles": {
-    "SuggestX.Gateway": {
+    // When the Gateway runs here, its cluster destinations come from
+    // appsettings.json — which lists both the container address and the
+    // local debug address for every routed service, and health-checks both.
+    "Gateway (local)": {
       "commandName": "Project",
-      "launchBrowser": true,
+      "dotnetRunMessages": true,
+      "launchBrowser": false,
+      "applicationUrl": "http://localhost:9080",
       "environmentVariables": {
         "ASPNETCORE_ENVIRONMENT": "Development"
-      },
-      "applicationUrl": "https://localhost:59457;http://localhost:59458"
+      }
     }
   }
 }

@@ -1,12 +1,20 @@
 {
+  "$schema": "https://json.schemastore.org/launchsettings.json",
   "profiles": {
-    "SuggestX.Aggregator": {
+    // Same port the container publishes (9083) — stop the container first,
+    // or this fails to bind. Not routed through the Gateway yet (no public
+    // API surface until Phase 6's admin/insights view), so debug it by
+    // hitting this port directly or by attaching to its background worker.
+    // See DEBUGGING.md.
+    "Aggregator (local)": {
       "commandName": "Project",
+      "dotnetRunMessages": true,
       "launchBrowser": true,
+      "launchUrl": "scalar",
+      "applicationUrl": "http://localhost:9083",
       "environmentVariables": {
         "ASPNETCORE_ENVIRONMENT": "Development"
-      },
-      "applicationUrl": "https://localhost:59449;http://localhost:59453"
+      }
     }
   }
 }

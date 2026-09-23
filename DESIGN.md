@@ -117,6 +117,33 @@ considered, and why this one won.
    different architecture for the ingest path, not a small addition; noted
    as an open question (§4) instead of quietly built around.
 
+10. **Local debugging reuses the container's own port, and the Gateway routes
+    to it through a single host-routed destination — not the two-destination
+    failover pattern JameX uses.** Not a doc-driven decision (nothing in the
+    source chapters addresses local tooling); this one exists purely because
+    of how the owner wanted to work with the code day to day, mirrored here
+    because getting it right cost real debugging effort worth recording. The
+    natural first instinct was to copy JameX's pattern exactly — two
+    destinations per cluster (`container` + `local`), `FirstAlphabetical`
+    load balancing to prefer the container. That's correct when local and
+    container run on genuinely different ports, because the two destinations
+    are then real, independently-addressable backends. Here they aren't:
+    with the same port number on both sides, a running container's own
+    published port answers *both* destination addresses (Docker's
+    port-forward doesn't distinguish a request that arrived from outside the
+    machine from one that looped back through `host-gateway`), so the two
+    entries were provably the same backend whenever the container was up —
+    and empirically, YARP's load-balancing choice between two destinations
+    that are always simultaneously healthy was not the deterministic
+    "alphabetically-first" behavior the policy name suggests, at least not
+    as configured here. Every response was still correct (same backend
+    either way), but the setup was undocumentable as designed. Collapsed to
+    one destination per cluster, always reached via the host route — the
+    same address correctly reaches the container (via its port-forward) or a
+    local debugger (bound directly), with nothing left to choose between.
+    Full account, including the verification process that caught this, in
+    `PROGRESS.md`'s Phase 2 entry and `DEBUGGING.md`.
+
 ## §2 Failure-mode table
 
 | Failure | Effect without mitigation | Mitigation in this build |

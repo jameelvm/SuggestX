@@ -1,12 +1,17 @@
 {
+  "$schema": "https://json.schemastore.org/launchsettings.json",
   "profiles": {
-    "SuggestX.SuggestionService": {
+    // Same port the container publishes (9081) — stop the container first,
+    // or this fails to bind. See DEBUGGING.md.
+    "SuggestionService (local)": {
       "commandName": "Project",
+      "dotnetRunMessages": true,
       "launchBrowser": true,
+      "launchUrl": "scalar",
+      "applicationUrl": "http://localhost:9081",
       "environmentVariables": {
         "ASPNETCORE_ENVIRONMENT": "Development"
-      },
-      "applicationUrl": "https://localhost:59452;http://localhost:59455"
+      }
     }
   }
 }
