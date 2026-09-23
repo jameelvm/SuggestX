@@ -5,8 +5,9 @@
 Say this to Claude at the start of the next session:
 
 > Read PROGRESS.md and CLAUDE.md in C:\System Design\TypeheadSuggestion\App,
-> then start Phase 3 — Aggregator. Build it in short modules, pausing
-> after each one so I can review before you continue.
+> then continue Phase 3 — Aggregator, Module 2 (map-reduce into DynamoDB).
+> Build it in short modules, pausing after each one so I can review before
+> you continue.
 
 **Build in short modules.** One concept per module, verified and explained
 before moving on — same discipline as JameX.
@@ -36,6 +37,8 @@ state* and *Next up* sections at the end of every session.
 **Last updated:** 2026-09-23
 **Phase 1 — local substrate. Complete, verified.**
 **Phase 2 — Collection Service. Complete, verified.**
+**Phase 3 — Aggregator. Module 1 (read new raw logs on a timer) complete,
+verified. Module 2 (map-reduce into DynamoDB) next.**
 **Local debugging (cross-cutting, not a phase) — set up and verified.**
 Every service can now run under the Visual Studio debugger, on the exact
 port its container publishes, with the Gateway automatically reaching
@@ -213,17 +216,60 @@ correct, not an oversight.
 
 ### In progress
 
-Nothing — awaiting go-ahead to start Phase 3 (Aggregator).
+**Phase 3 — Aggregator.**
+
+- [x] **Module 1 — read new raw-log objects on a timer.**
+      `S3RawLogReader` (`Services/`) lists `suggestx-raw-logs` via
+      `ListObjectsV2` with `StartAfter` set to the last processed key
+      (handling pagination via `ContinuationToken`), reads and parses each
+      new object's JSONL lines into `SearchLogEntry`, one malformed line
+      logged and skipped rather than sinking the whole batch.
+      `InMemoryAggregatorCheckpoint` (`Services/`) tracks the last processed
+      key — in-memory only for now, so a restart currently reprocesses from
+      the start of the bucket; durable persistence is Module 3, not silently
+      assumed done early. `RawLogPollingWorker` (`Jobs/`, a
+      `BackgroundService` on `Aggregator:PollIntervalSeconds`, default 15s)
+      polls immediately on startup (unlike CollectionService's flush worker,
+      which waits for its first tick — a fresh Aggregator may start well
+      after raw logs already exist, so waiting before the first read would
+      be a pure, avoidable delay), advances the checkpoint per-batch rather
+      than once per cycle so a mid-cycle crash only re-reads the batches it
+      hadn't finished, and catches read failures without crashing the poll
+      loop. `AggregatorDebugController` exposes `GET /_debug/status`
+      (batches/entries processed, last poll time, last processed key) —
+      module 1 does nothing durable yet, so this is the only way to observe
+      it working.
+
+      **A real bug, found live, not by reading the SDK's docs closely
+      enough first:** `ListObjectsV2Response.S3Objects` comes back `null`,
+      not an empty list, when a page has no matches — which is the
+      overwhelmingly common outcome of a poll cycle that finds nothing new.
+      The first version's unguarded `response.S3Objects.Select(...)` threw
+      `ArgumentNullException` on exactly that case; caught by the worker's
+      own error handling (logged, didn't crash the loop, self-healed next
+      tick), but "the normal case throws and is silently absorbed by a
+      safety net meant for actual transient failures" is a real bug, not
+      something to leave relying on resilience to paper over. Fixed with an
+      explicit null/empty check before the `Select`.
+
+      **Verified against the live stack:** on startup, immediately and
+      correctly processed all 15 pre-existing objects from earlier Phase 2/
+      debugging-session testing (24 entries total) in one poll, proving
+      pagination and a null `afterKey` both work; posting one new event and
+      waiting a cycle moved `batchesProcessed` from 15→16 and
+      `entriesProcessed` from 24→25 — not 15→30 — proving `StartAfter`
+      genuinely filters to only what's new, not re-reading the backlog
+      every cycle; three consecutive idle poll cycles (45s, nothing posted)
+      produced zero errors and zero log lines after the `S3Objects` fix,
+      where the unfixed version had thrown on the very first idle cycle it
+      hit; a final fresh event confirmed end-to-end after the fix,
+      `batchesProcessed`/`entriesProcessed` advancing by exactly one and the
+      correct query text appearing in the log line.
 
 ### Next up (immediate)
 
-**Phase 3 — Aggregator.** Proposed module breakdown (to confirm/adjust with
-the owner before starting):
+**Phase 3 — Aggregator**, continued:
 
-1. A `BackgroundService` reading new objects from `suggestx-raw-logs`
-   (read-only) since the last checkpoint, using the sortable key prefix
-   `SearchEventFlushWorker` already writes to list only what's new via
-   `ListObjectsV2`'s `StartAfter`.
 2. An in-process map-reduce over each batch's phrases, atomically `ADD`ing
    counts into `suggestx-phrase-frequencies` (DynamoDB) — never a plain
    `PutItem`, so a redelivered/reprocessed batch increments rather than

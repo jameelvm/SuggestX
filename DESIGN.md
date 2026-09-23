@@ -256,7 +256,7 @@ build specifically (not left abstract).
 |---|---|---|---|
 | Suggestion service | 3, 5 | `src/services/SuggestX.SuggestionService/` | Scaffolded, health-check only so far; real Redis-`GET` read path arrives Phase 5. |
 | Collection service | 5 | `src/services/SuggestX.CollectionService/` | `POST /search-events` buffers in memory; `SearchEventFlushWorker` drains it on a timer (and on graceful shutdown) to `suggestx-raw-logs` as line-delimited JSON, keyed to sort chronologically and never collide across instances. Phase 2, complete. |
-| Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | Scaffolded as an API host for health/status now; the real `BackgroundService` batch worker arrives Phase 3. |
+| Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | `RawLogPollingWorker` reads new `suggestx-raw-logs` objects on a timer via a sortable-key checkpoint (Phase 3 Module 1). The map-reduce into DynamoDB counts arrives Module 2. |
 | Trie builder | 5 | `src/services/SuggestX.TrieBuilder/` | Scaffolded; the compressed trie + blue/green swap arrives Phase 4. |
 | Web servers / entry point | 3 | `src/services/SuggestX.Gateway/` | YARP proxy, two routes (`/api/suggestions`, `/api/search-events`) live; no auth layer, since the source doc has no identity concept at all. |
 | HDFS | 4, 5 | `suggestx-raw-logs` (S3, LocalStack) | `infra/localstack/init/01-bootstrap.sh`. See decision 3. |
