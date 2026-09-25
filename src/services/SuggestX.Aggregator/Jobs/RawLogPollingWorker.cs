@@ -5,15 +5,15 @@ using SuggestX.Aggregator.Services;
 namespace SuggestX.Aggregator.Jobs;
 
 /// <summary>
-/// The doc's "aggregator retrieves raw data from HDFS" step, made concrete —
-/// Module 1 of Phase 3: read and log what's new. Module 3: the checkpoint
-/// this worker reads/advances is now durably persisted in DynamoDB (see
-/// <see cref="DynamoAggregatorCheckpoint"/>), so a restart resumes instead
-/// of reprocessing the whole bucket. The map-reduce into
-/// suggestx-phrase-frequencies is still Module 2, not yet built.
+/// The doc's "aggregator" step, fully assembled: Module 1 reads what's new,
+/// Module 2 (<see cref="IPhraseFrequencyWriter"/>) turns it into phrase
+/// counts in suggestx-phrase-frequencies, Module 3
+/// (<see cref="DynamoAggregatorCheckpoint"/>) durably remembers how far it
+/// got, so a restart resumes instead of reprocessing the whole bucket.
 /// </summary>
 public sealed class RawLogPollingWorker(
     IRawLogReader reader,
+    IPhraseFrequencyWriter frequencyWriter,
     IAggregatorCheckpoint checkpoint,
     IAggregatorStats stats,
     IOptions<AggregatorOptions> options,
@@ -68,6 +68,29 @@ public sealed class RawLogPollingWorker(
                 string.Join(", ", batch.Entries.Select(e => e.Query)));
 
             stats.RecordBatch(batch.Key, batch.Entries.Count);
+
+            try
+            {
+                // Counts applied BEFORE the checkpoint advances, and the
+                // checkpoint only advances if this succeeds — reversing the
+                // order would let a crash between the two silently lose a
+                // batch's counts forever (checkpoint says "done," but the
+                // ADD never happened). A failure here stops this cycle
+                // rather than skipping ahead to the next batch: checkpoints
+                // must advance strictly in order, so processing batch N+1
+                // and advancing past batch N's key when N failed would
+                // permanently strand N's counts — it would never be read
+                // again. The next poll cycle retries from the same
+                // checkpoint instead.
+                await frequencyWriter.ApplyAsync(batch.Entries, ct);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex,
+                    "Failed to apply frequency counts for {Key} — stopping this poll cycle, will retry next tick",
+                    batch.Key);
+                return;
+            }
 
             // Advanced per-batch, not once at the end of the poll cycle, so
             // a crash partway through a large cycle re-reads only the

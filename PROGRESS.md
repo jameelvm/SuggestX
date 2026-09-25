@@ -5,9 +5,8 @@
 Say this to Claude at the start of the next session:
 
 > Read PROGRESS.md and CLAUDE.md in C:\System Design\TypeheadSuggestion\App,
-> then continue Phase 3 — Aggregator, Module 2 (map-reduce into DynamoDB).
-> Build it in short modules, pausing after each one so I can review before
-> you continue.
+> then start Phase 4 — Trie data structure + Trie Builder. Build it in short
+> modules, pausing after each one so I can review before you continue.
 
 **Build in short modules.** One concept per module, verified and explained
 before moving on — same discipline as JameX.
@@ -42,10 +41,11 @@ worker, closing the ungraceful-kill data-loss gap `DESIGN.md` decision 9
 left open. See decision 11 and this file's Phase 2 entry for the full
 account, including what was considered and rejected (SQS) and a real
 LocalStack emulation limitation found along the way.
-**Phase 3 — Aggregator. Module 1 (read new raw logs on a timer) and Module 3
-(durable checkpoint persistence in DynamoDB) complete, verified — including
-a genuine container restart proving the checkpoint survives it. Module 2
-(map-reduce into DynamoDB frequency counts) is the only piece left.**
+**Phase 3 — Aggregator. Complete, verified.** All three modules done: reading
+new raw logs on a timer, the actual map-reduce into
+`suggestx-phrase-frequencies` (case-insensitive, atomic `ADD`, one write per
+unique phrase per batch), and durable checkpoint persistence in DynamoDB —
+proven across a genuine container restart, not just a fresh start.
 **Local debugging (cross-cutting, not a phase) — set up and verified.**
 Every service can now run under the Visual Studio debugger, on the exact
 port its container publishes, with the Gateway automatically reaching
@@ -251,10 +251,9 @@ correct, not an oversight.
       TrieBuilder have `launchSettings.json` profiles too but no Gateway
       route to verify through yet (Phase 6).
 
-### In progress
-
-**Phase 3 — Aggregator.**
-
+- [x] **Phase 3 — Aggregator.** Delivered as three modules, in the order
+      below (Module 3 built out of order, ahead of Module 2, at the
+      owner's request):
 - [x] **Module 1 — read new raw-log objects on a timer.**
       `S3RawLogReader` (`Services/`) lists `suggestx-raw-logs` via
       `ListObjectsV2` with `StartAfter` set to the last processed key
@@ -351,20 +350,85 @@ correct, not an oversight.
       skipped, not just that the counter looked right; posted one more
       event after the restart and confirmed `batchesProcessed: 1` (not 3),
       the final proof that only the truly new object was read.
+- [x] **Module 2 — the actual map-reduce.** `IPhraseFrequencyWriter`/
+      `DynamoPhraseFrequencyWriter` (`Services/`): for each batch, "map" is
+      an in-memory `Dictionary<string, long>` counting each normalized
+      phrase's occurrences within that one batch; "reduce" is one atomic
+      DynamoDB `UpdateItem` (`ADD frequency :inc`) per *unique* phrase in
+      the batch, not one write per entry — ten people searching the same
+      thing in one S3 object costs one write, not ten. `ADD` both creates
+      the row (initializing the count) and increments an existing one, so
+      no separate existence check or read-before-write is needed, and no
+      race between concurrent writers. Normalization
+      (`query.Trim().ToLowerInvariant()`) lives in exactly one place — the
+      doc's own stated assumption ("for simplicity, this data is
+      case-insensitive") is enforced here and nowhere else; every later
+      reader of this table (TrieBuilder included) can trust every `phrase`
+      value is already normalized and never has to re-derive that.
+
+      **Ordering is the real correctness property, not the ADD itself:**
+      `RawLogPollingWorker` applies a batch's counts *before* advancing its
+      checkpoint, and only advances if the write succeeded — reversing that
+      order would let a crash between the two silently lose a batch's
+      counts forever (checkpoint says "done," but the counts never landed).
+      A failure now stops the whole poll cycle rather than skipping to the
+      next batch, because checkpoints must advance strictly in order:
+      skipping past a failed batch to a later one that succeeds would
+      permanently strand the failed batch's counts (the checkpoint moves
+      past its key, so it is never read again). The next poll cycle retries
+      from the same checkpoint instead.
+
+      **A residual gap, named rather than hidden:** there is still a narrow
+      window — an actual process crash between a successful `ADD` and the
+      checkpoint's own durable write — where a restart would re-read and
+      re-count that one batch, double-counting it. Not closed here,
+      deliberately: closing it needs either a per-object idempotency guard
+      (a second table tracking "have I applied this exact S3 key's counts
+      yet") or a transactional write spanning two DynamoDB tables, real
+      added complexity for a rare, bounded (at most one batch's worth),
+      self-correcting-over-time overcount — consistent with this project's
+      running theme (decisions 2 and 9) of accepting small, bounded
+      inaccuracy over defensive machinery for edge cases far rarer than the
+      thing they'd protect against.
+
+      **Verified against the live stack, checking DynamoDB directly, not
+      just the debug endpoint:** posted "jazz piano" and "jazz age" as two
+      separate events — both appeared as two separate rows with
+      `frequency: 1` each; posted "jazz piano" again — its row's
+      `frequency` went 1→2, confirming `ADD` accumulates correctly across
+      separate poll cycles, not just within one batch; posted "JAZZ Piano"
+      (mixed case) — it merged into the *same* `jazz piano` row
+      (`frequency` 2→3) rather than creating a second row, confirming
+      case-insensitive normalization works exactly as the doc assumes; zero
+      errors across the entire sequence, confirmed against the full
+      container log, not just the absence of an error status code.
+
+### In progress
+
+Nothing — Phase 3 is complete. Awaiting go-ahead to start Phase 4
+(Trie data structure + Trie Builder).
 
 ### Next up (immediate)
 
-**Phase 3 — Aggregator**, continued (Module 3 done out of order, at the
-owner's request — Module 2 below is still the only piece left):
+**Phase 4 — Trie data structure + Trie Builder.** Proposed module
+breakdown (to confirm/adjust with the owner before starting):
 
-2. An in-process map-reduce over each batch's phrases, atomically `ADD`ing
-   counts into `suggestx-phrase-frequencies` (DynamoDB) — never a plain
-   `PutItem`, so a redelivered/reprocessed batch increments rather than
-   resets a real count.
-3. ~~Checkpoint persistence~~ — done (Module 3, above).
-4. Verify: post real search events, let Aggregator's cycle run, confirm
-   DynamoDB counts increment correctly; re-run the same batch and confirm
-   idempotency.
+1. A compressed trie data structure in memory (merge single-child chains —
+   see `DESIGN.md` §1 decision 2's Q&A entry on trie traversal time),
+   built by reading every row of `suggestx-phrase-frequencies` on a timer.
+2. Walk the trie once per build cycle to precompute `prefix → top-N` for
+   every prefix up to a bounded length (decision 6's configurable cap),
+   and write that flattened projection into Redis under a new version
+   namespace (`trie:v{N}:{prefix}`) — not overwriting whatever
+   `SuggestionService` is currently reading.
+3. Persist a full trie snapshot to `suggestx-trie-snapshots` (S3) for
+   recovery, then flip the ZooKeeper `current_version` znode for each
+   partition only after the new version is fully written and validated —
+   the blue/green swap from decision 8.
+4. Verify: real frequency data flows to a real flattened Redis cache;
+   confirm a prefix that wasn't previously served starts returning results
+   after a build cycle; confirm the old version's keys are only evicted
+   after the swap succeeds, not before.
 
 ---
 
@@ -378,8 +442,9 @@ Ordered. Each phase leaves the build green **and** updates `README.md` and
    containerised and health-checked.
 2. ~~Collection Service~~ — done. `POST /search-events` + buffer, timed
    flush to S3, graceful-shutdown flush, all verified live.
-3. **Aggregator** — S3 raw logs → DynamoDB frequency table, checkpointed
-   batch worker. Not started.
+3. ~~Aggregator~~ — done. S3 raw logs → DynamoDB frequency table, durably
+   checkpointed batch worker, all verified live including across a real
+   container restart.
 4. **Trie data structure + Trie Builder** — compressed trie in memory, top-N
    flattening into Redis, S3 snapshot for recovery, ZooKeeper blue/green
    version swap. Not started.

@@ -230,12 +230,50 @@ considered, and why this one won.
     genuinely easy, repeatable mistake to assume otherwise for the next
     one too.
 
+13. **Phrase counting is per-batch map-reduce (count within the batch, one
+    atomic `ADD` per unique phrase), applied strictly before the
+    checkpoint advances for that batch — and a narrow double-count race
+    is accepted rather than closed.** The doc's own chapter frames this as
+    "for simplicity, this data is case-insensitive," so normalization
+    (`Trim().ToLowerInvariant()`) happens in exactly one place —
+    `DynamoPhraseFrequencyWriter` — and nowhere else in the system ever
+    needs to think about casing again, including TrieBuilder once it
+    reads this table. `ADD` was chosen over a read-modify-write `PutItem`
+    for the same reason it was chosen for the checkpoint and for
+    CollectionService's original design (decision 9): it both creates and
+    increments in one atomic server-side step, so concurrent writers (or a
+    redelivered batch) can never race or silently reset a count.
+
+    The ordering — apply counts, *then* advance the checkpoint, and only
+    if the apply succeeded — is the actual correctness property, not the
+    `ADD`'s own atomicity. Reversing it would let a crash between the two
+    silently lose a batch's counts forever, since the checkpoint would
+    claim the batch was handled when its counts never landed. A failed
+    apply stops the whole poll cycle rather than skipping to the next
+    batch, because checkpoints must advance strictly in order: skipping a
+    failed batch to process a later one that succeeds would permanently
+    strand the failed batch's counts behind an advanced checkpoint that
+    can never point back to it.
+
+    **What this does not close, on purpose:** a genuine process crash
+    between a successful `ADD` and the checkpoint's own durable write
+    would still cause a restart to re-read and re-count that one batch,
+    over-counting it by however many entries it held. Not fixed here — a
+    real fix needs either a per-object idempotency guard (tracking which
+    exact S3 keys have already been applied, not just the most recent one)
+    or a transaction spanning two DynamoDB tables, real complexity for a
+    rare, self-bounded (at most one batch), one-time overcount. Consistent
+    with decisions 2 and 9's running theme: this system accepts small,
+    bounded inaccuracy in exchange for not building defensive machinery
+    against failures far rarer than the thing they'd protect.
+
 ## §2 Failure-mode table
 
 | Failure | Effect without mitigation | Mitigation in this build |
 |---|---|---|
 | `TrieBuilder` crashes mid-build | Partial/corrupt version could be served | Blue/green swap (decision 8): the ZooKeeper pointer only flips after the full new version is written and validated, so a crash mid-build leaves the previously-served version untouched. |
 | Aggregator falls behind (batch job takes longer than its own interval) | Frequencies grow stale, or two runs overlap and double-count | Aggregator checkpoints its S3 read offset per run; a run that overlaps the next start is a documented open question (see §4) rather than silently assumed away. |
+| Aggregator crashes between a successful frequency `ADD` and its checkpoint's durable write | A restart re-reads and re-counts that one batch, over-counting it | Not mitigated — accepted as a rare, self-bounded (at most one batch) overcount rather than adding an idempotency guard or a cross-table transaction. See decision 13. |
 | ZooKeeper unreachable | `SuggestionService` cannot learn the current version | Suggestion Service caches the last-known version/partition map in memory and continues serving it; a ZooKeeper outage degrades to "suggestions may go stale," not "suggestions stop." |
 | A Redis partition is unreachable | Every query for that prefix range fails | Redis's own primary-replica replication (not hand-rolled app failover) is the mitigation — matches how a real deployment would actually solve this, rather than inventing bespoke failover code. |
 | A hot prefix range gets disproportionate load (e.g., everything starting "S") | One partition's servers overload while others idle | Named directly in the source doc as range partitioning's real weakness. Left as an open, unsolved question here (see §4) rather than hidden — a hash-based secondary partitioning layer is the real answer and is out of scope for this build. |
@@ -343,6 +381,11 @@ build specifically (not left abstract).
   fix from the application side; means local testing can verify the
   delivery pipeline works but not that batching reduces S3 PUT volume the
   way it would against real AWS Firehose.
+- **Aggregator can over-count a batch on an ungraceful crash between a
+  successful frequency `ADD` and its checkpoint's durable write** —
+  decision 13. Not closed; a real fix needs a per-object idempotency guard
+  or a cross-table transaction, both real complexity for a rare,
+  self-bounded (at most one batch) overcount.
 
 ## §5 Doc-to-code map
 
@@ -350,7 +393,7 @@ build specifically (not left abstract).
 |---|---|---|---|
 | Suggestion service | 3, 5 | `src/services/SuggestX.SuggestionService/` | Scaffolded, health-check only so far; real Redis-`GET` read path arrives Phase 5. |
 | Collection service | 5 | `src/services/SuggestX.CollectionService/` | `POST /search-events` validates and publishes to the `suggestx-search-events` Firehose delivery stream, awaiting durable acceptance before returning 202. Owns no store, holds no state. Phase 2, complete; the original in-memory buffer/flush-worker design was replaced by decision 11. |
-| Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | `RawLogPollingWorker` reads new `suggestx-raw-logs` objects on a timer via a sortable-key checkpoint, durably persisted in `suggestx-aggregator-checkpoints` (DynamoDB) so a restart resumes instead of reprocessing the bucket (Phase 3 Modules 1 and 3). The map-reduce into phrase-frequency counts arrives Module 2. |
+| Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | `RawLogPollingWorker` reads new `suggestx-raw-logs` objects on a timer via a sortable-key checkpoint, durably persisted in `suggestx-aggregator-checkpoints` (DynamoDB). `IPhraseFrequencyWriter` maps and reduces each batch's phrases into atomic `ADD`s against `suggestx-phrase-frequencies`, case-insensitive. Phase 3, complete (Modules 1–3). |
 | Trie builder | 5 | `src/services/SuggestX.TrieBuilder/` | Scaffolded; the compressed trie + blue/green swap arrives Phase 4. |
 | Web servers / entry point | 3 | `src/services/SuggestX.Gateway/` | YARP proxy, two routes (`/api/suggestions`, `/api/search-events`) live; no auth layer, since the source doc has no identity concept at all. |
 | HDFS | 4, 5 | `suggestx-raw-logs` (S3, LocalStack), written by the `suggestx-search-events` Firehose delivery stream, not directly by a service | `infra/localstack/init/01-bootstrap.sh`. See decision 3 (why S3) and decision 11 (why Firehose writes it instead of CollectionService). |
@@ -367,7 +410,7 @@ build specifically (not left abstract).
 | Trie partitioning by prefix range | ⬜ Designed, not built |
 | Offline trie updates (MapReduce-style) | ⬜ Designed, not built |
 | Collection service | ✅ Built and verified (Phase 2) |
-| Aggregator | ⬜ Designed, not built |
+| Aggregator | ✅ Built and verified (Phase 3) |
 | Trie builder + ZooKeeper-coordinated swap | ⬜ Designed, not built |
 | Suggestion service (Redis-backed) | ⬜ Designed, not built |
 | Client-side optimizations (debounce, input threshold, local cache, early connection, edge cache) | ⬜ Designed, not built |
