@@ -100,22 +100,23 @@ considered, and why this one won.
    worth of Redis memory briefly) is cheap at local/demo scale and cheap in
    real deployments too, relative to the cost of a read-path outage.
 
-9. **A failed S3 flush is logged and dropped, not retried — and an
-   ungraceful `CollectionService` kill can still lose buffered events.**
-   Phase 0's failure-mode table originally predicted "a bounded retry before
-   drop"; Phase 2 built something simpler on purpose. A retry loop inside
-   the flush worker risks the *next* timer tick firing while a retry of the
-   *previous* one is still in flight, double-buffering complexity for a
-   pipeline whose own stated design already accepts imperfect accuracy (see
-   decision 2's framing: undercounting a trend is tolerable, corrupting one
-   is not). The harder gap — an ungraceful kill (SIGKILL, OOM, a crashed
-   process) loses whatever's in memory since the last successful flush,
-   because `StopAsync`'s graceful-shutdown flush only ever runs on a clean
-   SIGTERM — is left open rather than papered over. Closing it for real
-   needs a write-ahead durability layer (e.g., acking the client only after
-   an append to a local file or a durable queue), which is a genuinely
-   different architecture for the ingest path, not a small addition; noted
-   as an open question (§4) instead of quietly built around.
+9. ~~A failed S3 flush is logged and dropped, not retried — and an
+   ungraceful `CollectionService` kill can still lose buffered events.~~
+   **SUPERSEDED by decision 11.** Phase 0's failure-mode table originally
+   predicted "a bounded retry before drop"; Phase 2 built something simpler
+   on purpose: a retry loop inside the flush worker risks the *next* timer
+   tick firing while a retry of the *previous* one is still in flight,
+   double-buffering complexity for a pipeline whose own stated design
+   already accepted imperfect accuracy (see decision 2's framing:
+   undercounting a trend is tolerable, corrupting one is not). The harder
+   gap this decision originally accepted — an ungraceful kill (SIGKILL,
+   OOM, a crashed process) losing whatever was in memory since the last
+   successful flush, because `StopAsync`'s graceful-shutdown flush only
+   ever ran on a clean SIGTERM — is exactly the gap decision 11 closes for
+   real, not with a bigger retry loop but by removing the in-process buffer
+   from the durability boundary entirely. Left here, struck through rather
+   than deleted, because the reasoning for *why* a retry loop was rejected
+   is still correct and still worth keeping.
 
 10. **Local debugging reuses the container's own port, and the Gateway routes
     to it through a single host-routed destination — not the two-destination
@@ -144,6 +145,91 @@ considered, and why this one won.
     Full account, including the verification process that caught this, in
     `PROGRESS.md`'s Phase 2 entry and `DEBUGGING.md`.
 
+11. **CollectionService's in-memory buffer and timer-driven flush worker
+    were replaced with Kinesis Data Firehose.** Not a doc-driven decision —
+    the source chapters say "collection service logs the phrase, timestamp,
+    and metadata," nothing more specific — but a direct response to
+    decision 9's open gap: an ungraceful kill of `CollectionService` could
+    lose events that were accepted (202 returned) but not yet flushed,
+    because durability lived only in that one process's RAM. Firehose
+    closes this the right way, not a bigger way: `POST /search-events` now
+    calls `PutRecord` and does not return 202 until Firehose has durably
+    accepted the record — durability moved out of this process entirely,
+    so killing the process can no longer lose an already-accepted event.
+    `SearchEventBuffer`, `SearchEventFlushWorker`, and their config
+    (`CollectionOptions.FlushIntervalSeconds`) are deleted, not deprecated;
+    `CollectionService` now owns no store and holds no state.
+
+    **Considered and rejected: SQS.** Genuinely the more consistent choice
+    with this codebase's own conventions (it's the sibling JameX project's
+    pattern for exactly this kind of durability problem), and it would keep
+    the batching/flush logic under this project's own code rather than
+    handing a whole pipeline stage to a managed service. Firehose won
+    anyway because the problem is *specifically* "buffer records, batch-write
+    them to S3" — Firehose's literal job description — not a general work
+    queue that happens to be used this way. Choosing SQS here would mean
+    re-hand-rolling the same flush-worker logic decision 9 already built,
+    just reading from a durable source instead of an in-memory one; Firehose
+    removes that whole class of code rather than hardening it.
+
+    **A real LocalStack emulation gap, found by testing, not assumed
+    away:** `BufferingHints.IntervalInSeconds` (set to 10s here — AWS's own
+    real minimum for an S3 destination is 60s, so this was already a
+    demo-scale value) is not honored by LocalStack's Firehose emulation at
+    all. Every `PutRecord` call was observed landing in S3 as its own
+    separate, single-record object within roughly one second — including
+    under a 10-request concurrent burst, which should have landed in one
+    combined object if buffering worked. This does not break correctness
+    here (Aggregator's line-by-line JSONL parser handles a one-line object
+    exactly as well as a many-line one, and `ListObjectsV2`'s lexicographic
+    ordering still correlates with chronological order well enough for the
+    `StartAfter` checkpoint to work unmodified against Firehose's own
+    `search-events/yyyy/MM/dd/HH/...` key format — verified directly, no
+    code changes needed), but it means local testing cannot demonstrate the
+    actual batching behavior that is the entire point of choosing Firehose
+    over one-object-per-event — only that the delivery pipeline itself
+    (accept → durable → land in S3 with correct content) works. That
+    specific claim — "this reduces S3 PUT volume the way real Firehose
+    would" — is asserted from AWS's own documented behavior, not verified
+    against this local stack.
+
+    **A second real requirement, found empirically, not documented clearly
+    enough by LocalStack's own docs to plan for in advance:** an S3-backed
+    delivery stream needs `sts` and `iam` enabled in LocalStack's
+    `SERVICES` list alongside `firehose` — Firehose's S3 delivery path
+    calls `sts:AssumeRole` against the configured `RoleARN` even under
+    emulation, and fails outright without it.
+
+12. **Aggregator's own read-progress checkpoint is durably persisted in a
+    dedicated DynamoDB table, `suggestx-aggregator-checkpoints`, not the
+    phrase-frequencies table.** Module 1 shipped this as an in-memory
+    field deliberately, documented as an open gap rather than a finished
+    feature — a restart reprocessed the whole raw-logs bucket from the
+    start. Closing it needed exactly one durable value (a single S3 key),
+    which argued for a small, separate table rather than folding a
+    sentinel row into `suggestx-phrase-frequencies`: a checkpoint is
+    operational state, not a phrase count, and mixing the two would mean
+    every future thing that scans that table for real data (Module 2's own
+    consumers, TrieBuilder, any analysis or export) would need to know to
+    skip one special row forever. `IAggregatorCheckpoint` reads from an
+    in-memory cache (cheap, no DynamoDB round trip per poll) and
+    write-throughs to DynamoDB on every advance (so the durable copy is
+    never more than one batch stale) — the same read-cache/write-through
+    shape as decision 11's Firehose publisher being awaited before
+    acking, applied to internal state instead of an external caller.
+
+    **The exact same AWS SDK gotcha as decision 9/Module 1's `S3Objects`
+    bug, in a different response type, caught the same way — live, not
+    from documentation:** `GetItemResponse.Item` is `null`, not an empty
+    dictionary, when no item exists for the given key. The first version's
+    unguarded `.TryGetValue(...)` on it threw `NullReferenceException` on
+    every first-ever run — exactly the case that matters most, a brand new
+    table with nothing in it. Worth generalizing rather than treating as
+    two unrelated one-off bugs: several AWS SDK response types return
+    `null`, not an empty collection, for "nothing here," and it is a
+    genuinely easy, repeatable mistake to assume otherwise for the next
+    one too.
+
 ## §2 Failure-mode table
 
 | Failure | Effect without mitigation | Mitigation in this build |
@@ -153,8 +239,9 @@ considered, and why this one won.
 | ZooKeeper unreachable | `SuggestionService` cannot learn the current version | Suggestion Service caches the last-known version/partition map in memory and continues serving it; a ZooKeeper outage degrades to "suggestions may go stale," not "suggestions stop." |
 | A Redis partition is unreachable | Every query for that prefix range fails | Redis's own primary-replica replication (not hand-rolled app failover) is the mitigation — matches how a real deployment would actually solve this, rather than inventing bespoke failover code. |
 | A hot prefix range gets disproportionate load (e.g., everything starting "S") | One partition's servers overload while others idle | Named directly in the source doc as range partitioning's real weakness. Left as an open, unsolved question here (see §4) rather than hidden — a hash-based secondary partitioning layer is the real answer and is out of scope for this build. |
-| S3 raw-log write fails from `CollectionService` | A user's search event is lost, undercounting a real trend | `SearchEventFlushWorker` logs and drops the batch rather than retrying — see decision 9 for why no retry was built, even though row-112's original prediction (Phase 0) assumed one. |
-| `CollectionService` is killed ungracefully (SIGKILL, crash, OOM) between flush cycles | Whatever's in the in-memory buffer since the last successful flush is lost — the graceful-shutdown flush (`StopAsync`) only runs on a clean SIGTERM, never on a hard kill | Not mitigated. A genuine, acknowledged gap: closing it needs a write-ahead durability layer (e.g., append to a local file or a queue before acking the client), which this build deliberately doesn't add — see decision 9. |
+| `PutRecord` to Firehose fails from `CollectionService` | Without care, the caller could get a false 202 for an event that was never durably accepted | `SearchEventsController` awaits `PutRecordAsync` before returning 202 and returns 503 on failure instead — the caller, not this service, decides whether to retry. See decision 11. |
+| `CollectionService` is killed ungracefully (SIGKILL, crash, OOM) | — | No longer a distinct risk: the service holds no buffer and no state to lose. An event is either durably in Firehose (202 already returned) or it never was (the client got an error and knows to retry). See decision 11 — this row is kept to show the failure mode decision 9 accepted is now closed, not to describe a live gap. |
+| LocalStack's Firehose emulation doesn't honor `BufferingHints` | Local testing can't observe real batching/buffering behavior, only whether the delivery pipeline itself works | Not mitigated, and can't be from this side — it's an emulator gap, not an application bug. Documented explicitly in decision 11 rather than assumed to match real AWS Firehose. |
 | `SuggestionService` instance restarts | Cold start with no cached version/partition map | Reads current state from ZooKeeper on startup before serving; documented startup-ordering dependency (ZooKeeper must be reachable at boot, even though it's not required per-request after that). |
 
 ## §3 Q&A bank
@@ -244,22 +331,29 @@ build specifically (not left abstract).
   question, not a requirement; not built.
 - **Personalization** — designed above, not yet built; tracked as a later
   phase in `PROGRESS.md`.
-- **CollectionService has no write-ahead durability** — an ungraceful kill
-  between flush cycles loses buffered events (decision 9). A real fix needs
-  a different ingest architecture (durable queue or local write-ahead log
-  before acking the client), not a patch to the current in-memory buffer;
-  out of scope for this build.
+- ~~CollectionService has no write-ahead durability~~ — **resolved by
+  decision 11.** `POST /search-events` now durably hands each event to
+  Firehose before returning 202, so an ungraceful kill of `CollectionService`
+  has nothing left in-process to lose.
+- **LocalStack's Firehose emulation doesn't honor `BufferingHints`** — every
+  `PutRecord` was observed landing in S3 as its own object almost
+  immediately, not batched with others in the same interval (decision 11).
+  Confirmed real via a 10-request concurrent burst that still produced 10
+  separate objects. An emulator limitation, not something this project can
+  fix from the application side; means local testing can verify the
+  delivery pipeline works but not that batching reduces S3 PUT volume the
+  way it would against real AWS Firehose.
 
 ## §5 Doc-to-code map
 
 | Doc concept | Chapter | File(s) | Why this choice |
 |---|---|---|---|
 | Suggestion service | 3, 5 | `src/services/SuggestX.SuggestionService/` | Scaffolded, health-check only so far; real Redis-`GET` read path arrives Phase 5. |
-| Collection service | 5 | `src/services/SuggestX.CollectionService/` | `POST /search-events` buffers in memory; `SearchEventFlushWorker` drains it on a timer (and on graceful shutdown) to `suggestx-raw-logs` as line-delimited JSON, keyed to sort chronologically and never collide across instances. Phase 2, complete. |
-| Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | `RawLogPollingWorker` reads new `suggestx-raw-logs` objects on a timer via a sortable-key checkpoint (Phase 3 Module 1). The map-reduce into DynamoDB counts arrives Module 2. |
+| Collection service | 5 | `src/services/SuggestX.CollectionService/` | `POST /search-events` validates and publishes to the `suggestx-search-events` Firehose delivery stream, awaiting durable acceptance before returning 202. Owns no store, holds no state. Phase 2, complete; the original in-memory buffer/flush-worker design was replaced by decision 11. |
+| Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | `RawLogPollingWorker` reads new `suggestx-raw-logs` objects on a timer via a sortable-key checkpoint, durably persisted in `suggestx-aggregator-checkpoints` (DynamoDB) so a restart resumes instead of reprocessing the bucket (Phase 3 Modules 1 and 3). The map-reduce into phrase-frequency counts arrives Module 2. |
 | Trie builder | 5 | `src/services/SuggestX.TrieBuilder/` | Scaffolded; the compressed trie + blue/green swap arrives Phase 4. |
 | Web servers / entry point | 3 | `src/services/SuggestX.Gateway/` | YARP proxy, two routes (`/api/suggestions`, `/api/search-events`) live; no auth layer, since the source doc has no identity concept at all. |
-| HDFS | 4, 5 | `suggestx-raw-logs` (S3, LocalStack) | `infra/localstack/init/01-bootstrap.sh`. See decision 3. |
+| HDFS | 4, 5 | `suggestx-raw-logs` (S3, LocalStack), written by the `suggestx-search-events` Firehose delivery stream, not directly by a service | `infra/localstack/init/01-bootstrap.sh`. See decision 3 (why S3) and decision 11 (why Firehose writes it instead of CollectionService). |
 | Cassandra | 4, 5 | `suggestx-phrase-frequencies` (DynamoDB, LocalStack) | Same script. See decision 3. |
 | MongoDB (trie doc store) | 5 | `suggestx-trie-snapshots` (S3, LocalStack) | Same script. See decision 3 — S3, not a document store, deliberately. |
 | ZooKeeper | 5 | `zookeeper:3.9` container (`docker-compose.yml`) | Real container, not simulated. See decision 4. Znode round-trip verified manually via `zkCli.sh` in Phase 1; the application-level client arrives with TrieBuilder in Phase 4. |

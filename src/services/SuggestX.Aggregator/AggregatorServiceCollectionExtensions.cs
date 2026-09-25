@@ -11,7 +11,7 @@ public static class AggregatorServiceCollectionExtensions
     {
         services.Configure<AggregatorOptions>(configuration.GetSection(AggregatorOptions.SectionName));
 
-        services.AddSingleton<IAggregatorCheckpoint, InMemoryAggregatorCheckpoint>();
+        services.AddSingleton<IAggregatorCheckpoint, DynamoAggregatorCheckpoint>();
         services.AddSingleton<IAggregatorStats, AggregatorStats>();
         services.AddSingleton<IRawLogReader, S3RawLogReader>();
         services.AddHostedService<RawLogPollingWorker>();

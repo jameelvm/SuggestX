@@ -73,9 +73,15 @@ in a user's request path.
 |---|---|---|
 | Gateway | — (YARP routing + a small admin/insights aggregation) | — |
 | SuggestionService | — (stateless read path) | Redis (flattened top-N cache), ZooKeeper (version/partition znodes) |
-| CollectionService | `suggestx-raw-logs` (S3) | — |
+| CollectionService | — (stateless; publishes to Firehose, owns no store) | — |
 | Aggregator | `suggestx-phrase-frequencies` (DynamoDB) | `suggestx-raw-logs` (S3, read-only) |
 | TrieBuilder | `suggestx-trie-snapshots` (S3), the `trie:*` Redis namespace, ZooKeeper `/suggestx/**` znodes | `suggestx-phrase-frequencies` (DynamoDB, read-only) |
+
+`suggestx-raw-logs` (S3) is owned by the `suggestx-search-events` Kinesis
+Data Firehose delivery stream, not by any service — CollectionService
+publishes records to it, Firehose owns the buffering and the write. See
+`DESIGN.md` decision 11 for why a managed pipeline stage replaced what was
+originally CollectionService's own in-memory buffer and flush worker.
 
 No service reads another's database directly; the only cross-service coupling
 is TrieBuilder writing into the Redis namespace and ZooKeeper znodes that
@@ -109,7 +115,8 @@ single biggest design decision in the whole system; see `DESIGN.md` §1.
 |---|---|---|
 | Services | .NET 10, ASP.NET Core MVC controllers + `BackgroundService` workers | — |
 | Gateway | YARP | "web servers" |
-| Raw query log | S3 (`suggestx-raw-logs`), batched line-delimited JSON | HDFS |
+| Search-event ingestion | Kinesis Data Firehose (`suggestx-search-events`) → S3 | — (a real AWS managed service filling the role a hand-rolled buffer/flush worker played through Phase 2 — see `DESIGN.md` decision 11) |
+| Raw query log | S3 (`suggestx-raw-logs`), line-delimited JSON, written by Firehose | HDFS |
 | Aggregated frequencies | DynamoDB (`suggestx-phrase-frequencies`) | Cassandra |
 | Trie snapshots (durability/recovery) | S3 (`suggestx-trie-snapshots`) | the doc's MongoDB trie store — a blob store fits a serialized trie better than a KV item's 400KB cap |
 | Served cache | Redis, flattened `prefix → top-N` keys | Redis (unchanged) |
@@ -199,3 +206,9 @@ be confused).
 JameX) — LocalStack's freemium tier still requires a valid token for license
 activation even for community services like S3/DynamoDB. This project reuses
 the same personal token as JameX (same owner, same account).
+
+LocalStack's `SERVICES` list is `s3,dynamodb,firehose,sts,iam` — `sts` and
+`iam` are there because Firehose's S3 delivery path calls `sts:AssumeRole`
+against the delivery stream's configured role even under emulation, and
+fails outright without them. Easy to miss if you only think "I need
+Firehose" and enable just that.

@@ -34,11 +34,18 @@ state* and *Next up* sections at the end of every session.
 
 ## Current state
 
-**Last updated:** 2026-09-23
+**Last updated:** 2026-09-25
 **Phase 1 — local substrate. Complete, verified.**
-**Phase 2 — Collection Service. Complete, verified.**
-**Phase 3 — Aggregator. Module 1 (read new raw logs on a timer) complete,
-verified. Module 2 (map-reduce into DynamoDB) next.**
+**Phase 2 — Collection Service. Complete, verified — and since rebuilt on
+Kinesis Data Firehose** in place of the original in-memory buffer/flush
+worker, closing the ungraceful-kill data-loss gap `DESIGN.md` decision 9
+left open. See decision 11 and this file's Phase 2 entry for the full
+account, including what was considered and rejected (SQS) and a real
+LocalStack emulation limitation found along the way.
+**Phase 3 — Aggregator. Module 1 (read new raw logs on a timer) and Module 3
+(durable checkpoint persistence in DynamoDB) complete, verified — including
+a genuine container restart proving the checkpoint survives it. Module 2
+(map-reduce into DynamoDB frequency counts) is the only piece left.**
 **Local debugging (cross-cutting, not a phase) — set up and verified.**
 Every service can now run under the Visual Studio debugger, on the exact
 port its container publishes, with the Gateway automatically reaching
@@ -101,59 +108,89 @@ correct, not an oversight.
 - [x] **Phase 1 — local substrate.** Solution scaffold, all 5 services
       containerised and healthy, docker-compose + LocalStack + Redis + real
       ZooKeeper verified live end to end. Full detail in "Current state" above.
-- [x] **Phase 2 — Collection Service.** Delivered as two modules:
+- [x] **Phase 2 — Collection Service.** Originally delivered as two modules
+      (in-memory buffer + `POST /search-events`, then a timed flush worker
+      writing to S3 directly) and later **replaced end to end** by
+      publishing to Kinesis Data Firehose instead, once the buffer/flush
+      design's data-loss gap (see `DESIGN.md` decision 9) got a real fix
+      rather than a bigger retry loop. Both versions are recorded here —
+      the original build was real, verified work, not a wrong turn erased
+      from history; see `DESIGN.md` decision 11 for the full reasoning on
+      why it was replaced and what was considered instead (SQS).
 
-      1. **`POST /search-events` + in-memory buffer.**
-         `ISearchEventBuffer`/`SearchEventBuffer` (`Services/`) wraps a
-         `ConcurrentQueue<BufferedSearchEvent>` — `Enqueue` from the
-         controller, `DrainAll` for the flush worker, `Count` backing a
-         debug endpoint. `BufferedSearchEvent` (`Domain/`) assigns
-         `ReceivedAt` server-side at receipt time — never trusts a
-         client-supplied timestamp. `SearchEventsController` (`Api/`)
-         exposes `POST /search-events` (rejects a blank/whitespace-only
-         query with 400, otherwise 202 Accepted — "accepted" means
-         buffered, not yet durable) and a dev-only
-         `GET /search-events/_debug/count`.
-      2. **Timed flush to S3 + graceful-shutdown flush.**
-         `SearchEventFlushWorker` (`Jobs/`, a `BackgroundService`) drains
-         the buffer on a `PeriodicTimer` (`Collection:FlushIntervalSeconds`,
-         default 10s — demo-scale, not a production claim) and writes it as
-         one line-delimited-JSON object to `suggestx-raw-logs`, skipping
-         the write entirely when the buffer is empty. Each object's key is
-         `{yyyyMMddHHmmssfff}-{instanceId}.jsonl` — millisecond timestamp
-         prefix first so keys sort chronologically (Aggregator, Phase 3,
-         can use S3's `ListObjectsV2` `StartAfter` instead of reading every
-         object to find new ones), a per-process GUID suffix so two
-         instances can never collide even flushing at the same millisecond.
-         `StopAsync` is overridden to flush one last time on graceful
-         shutdown, so a container restart between timer ticks can't
-         silently drop buffered events. A failed S3 write is logged and
-         swallowed, not rethrown — matching the pipeline's documented
-         best-effort framing (a dropped batch undercounts a trend, never
-         corrupts one) and, just as important, so a transient S3 blip can't
-         crash the flush loop and take every *subsequent* batch down with
-         it. The line format is `SearchLogEntry` (`SuggestX.Contracts`, not
-         internal to CollectionService) — Aggregator is the other side of
-         this exact wire format, so it's a real cross-service contract, not
-         a local implementation detail.
+      **Original design (superseded 2026-09-25):** `ISearchEventBuffer`/
+      `SearchEventBuffer` wrapped a `ConcurrentQueue<BufferedSearchEvent>`;
+      `SearchEventFlushWorker` (a `BackgroundService`) drained it on a
+      10s timer (and once more on graceful shutdown) to one line-delimited
+      JSON object per flush in `suggestx-raw-logs`, keyed
+      `{timestamp}-{instanceId}.jsonl` so instances never collided.
+      Verified at the time: count-endpoint tracking, correct S3 content,
+      no-overwrite across flush cycles, no wasted writes on an empty
+      buffer, and — the most valuable test — a mid-interval
+      `docker compose stop` proving the graceful-shutdown flush actually
+      prevented data loss for a *clean* kill. What it could never close:
+      an *ungraceful* kill (SIGKILL, OOM, a crash) between flushes still
+      lost whatever was buffered, because durability lived only in that
+      one process's RAM.
 
-      **Verified against the live stack, including through the Gateway**:
-      count started at 0; two direct `POST`s brought it to 2; a
-      whitespace-only query was rejected with 400 and did not increment the
-      count; a `POST` through `http://localhost:9080/api/search-events`
-      (the Gateway's route) brought the count to 3 — confirming the full
-      path from the public route to the buffer, not just the controller in
-      isolation. Three posted events appeared in S3 after one flush cycle
-      with exactly the right content (`awslocal s3 cp ... -`, inspected
-      line by line) and the buffer count dropped back to 0; a second flush
-      cycle produced a second, distinct key rather than overwriting the
-      first; an idle interval with nothing posted produced **no** new
-      object (empty-buffer skip confirmed); posting one event and then
-      `docker compose stop`-ping the container mid-interval produced a
-      *third* object containing that exact event, with the container log
-      showing `Application is shutting down...` immediately followed by the
-      flush completing — proving the graceful-shutdown path actually
-      prevents data loss, not just that the code compiles.
+      **Current design — Kinesis Data Firehose.** `SearchEventBuffer`,
+      `SearchEventFlushWorker`, and `CollectionOptions` are deleted, not
+      deprecated. `SearchEventsController` now builds a `SearchLogEntry`
+      directly from the request and awaits `FirehoseSearchEventPublisher
+      .PublishAsync` (`Services/`, wraps `IAmazonKinesisFirehose
+      .PutRecordAsync`) before returning — 202 now means *Firehose durably
+      accepted this record*, not *this process is holding it in memory*.
+      A publish failure returns 503, not a silent drop — the caller, not
+      this service, now owns the retry decision. `IPublishedEventStats`
+      replaces the old buffered-count tracker with a published-count one,
+      backing `GET /search-events/_debug/status`. The delivery stream
+      itself (`suggestx-search-events`, S3 destination
+      `suggestx-raw-logs/search-events/`, `BufferingHints` of 1MB/10s) is
+      provisioned in `infra/localstack/init/01-bootstrap.sh`, idempotently
+      (`describe-delivery-stream` first) for the same reason the DynamoDB
+      table creation needed the same fix this session (see Environment
+      notes).
+
+      **Two real requirements found empirically, not from LocalStack's own
+      docs (which don't render a usable API-coverage table through normal
+      fetching):** an S3-destination delivery stream needs `sts` and `iam`
+      enabled in `SERVICES` alongside `firehose` — Firehose's S3 delivery
+      path calls `sts:AssumeRole` against the configured `RoleARN` even
+      under emulation, and the very first `PutRecord` attempt failed
+      outright without them. And: LocalStack's Firehose emulation does
+      **not** honor `BufferingHints.IntervalInSeconds` — every `PutRecord`
+      landed in S3 as its own separate object within about a second,
+      confirmed under a 10-request concurrent burst that still produced 10
+      separate objects rather than one combined one. Documented as a real,
+      acknowledged gap in `DESIGN.md` decision 11 rather than assumed to
+      match real AWS Firehose's actual batching behavior.
+
+      **A real compatibility question, answered by testing rather than
+      assumed either way:** would Aggregator's Phase 3 `ListObjectsV2`/
+      `StartAfter` checkpoint logic — built against CollectionService's own
+      flat, timestamp-prefixed key format — still work against Firehose's
+      very different `search-events/yyyy/MM/dd/HH/streamname-timestamp-
+      uuid` key format? Yes, unmodified: restarted Aggregator against 14
+      pre-existing Firehose-delivered objects and it caught up on all 14 in
+      one poll; posting one more moved the counters by exactly 1, not by
+      15, confirming the checkpoint still filters correctly. The
+      date-hierarchy prefix is still lexicographically time-ordered at the
+      hour level, which is all `StartAfter` needs — same-second collisions
+      between two objects' trailing UUIDs can reorder ties, but never skip
+      or duplicate anything, and ordering among same-second events doesn't
+      affect a frequency count anyway.
+
+      **Verified against the live stack, end to end, through the Gateway**:
+      a valid `POST` returned 202 and `publishedCount` incremented; a
+      blank query was still rejected with 400 (validation is unchanged);
+      a request through `http://localhost:9080/api/search-events`
+      succeeded identically to a direct call; the record appeared in S3
+      under `search-events/...` with exactly the right JSON content after
+      the configured interval; a 3-event burst and a 10-event concurrent
+      burst both delivered every event with correct content (as separate
+      objects, per the LocalStack limitation above); Aggregator picked up
+      every one of them without any code changes, checkpoint filtering
+      intact.
 - [x] **Local debugging setup (cross-cutting tooling, at the owner's
       request).** Every service got a `Properties/launchSettings.json` with
       a `"{Service} (local)"` profile bound to the *same* port number its
@@ -265,20 +302,69 @@ correct, not an oversight.
       hit; a final fresh event confirmed end-to-end after the fix,
       `batchesProcessed`/`entriesProcessed` advancing by exactly one and the
       correct query text appearing in the log line.
+- [x] **Module 3 — durable checkpoint persistence.** `InMemoryAggregatorCheckpoint`
+      deleted, replaced by `DynamoAggregatorCheckpoint` (`Services/`),
+      backed by a new table it owns exclusively,
+      `suggestx-aggregator-checkpoints` (partition key `checkpointId`,
+      provisioned idempotently in `01-bootstrap.sh` the same way as the
+      other tables) — kept separate from `suggestx-phrase-frequencies` so
+      operational state never needs special-casing in anything that later
+      scans the real frequency data. `IAggregatorCheckpoint` grew an
+      `InitializeAsync` (loads the last known key once at startup into an
+      in-memory cache) and changed `Advance` to an async `AdvanceAsync`
+      that write-throughs to DynamoDB on every call — reads stay a cheap
+      in-memory property access; only writes pay a DynamoDB round trip.
+      `RawLogPollingWorker.ExecuteAsync` now awaits `InitializeAsync`
+      before the polling loop starts, and awaits `AdvanceAsync` per batch
+      (unchanged per-batch-not-per-cycle reasoning from Module 1 — a
+      mid-cycle crash still only re-reads what it hadn't finished). A
+      failed durable write is logged, not thrown — the in-memory cache
+      already advanced, so the process keeps working correctly either way;
+      only a restart before the next successful write would resume from an
+      older point, safely re-reading a few already-processed batches.
+
+      **A second occurrence of the exact same bug class as Module 1's,
+      caught the same way — live, not from documentation:**
+      `GetItemResponse.Item` is `null`, not an empty dictionary, when no
+      item exists for the given key — identical shape to
+      `ListObjectsV2Response.S3Objects` being `null` instead of empty for
+      "no matches." The first version's unguarded
+      `response.Item.TryGetValue(...)` threw `NullReferenceException` on
+      every first-ever run (exactly the case that matters most — a brand
+      new checkpoint table with nothing in it yet). Fixed with an explicit
+      null/count check before touching the dictionary. Worth remembering
+      as a pattern for *any* future AWS SDK response property, not just
+      these two: several "get me one thing" APIs return `null` for "found
+      nothing" rather than an empty collection, and assuming otherwise is
+      an easy, repeatable mistake.
+
+      **Verified against the live stack, the real test being a genuine
+      container restart, not just a fresh start:** posted 2 events,
+      confirmed both processed (`batchesProcessed: 2`); confirmed the
+      checkpoint item actually existed in DynamoDB via
+      `awslocal dynamodb get-item`, matching the debug endpoint's
+      `lastProcessedKey` exactly; **restarted the Aggregator container**
+      and confirmed the startup log read `Checkpoint loaded: resuming
+      after <the exact same key>` — and, critically, the container's log
+      for that run showed **no** `Read 1 entries from ...` lines for either
+      of the 2 already-processed objects, proving they were genuinely
+      skipped, not just that the counter looked right; posted one more
+      event after the restart and confirmed `batchesProcessed: 1` (not 3),
+      the final proof that only the truly new object was read.
 
 ### Next up (immediate)
 
-**Phase 3 — Aggregator**, continued:
+**Phase 3 — Aggregator**, continued (Module 3 done out of order, at the
+owner's request — Module 2 below is still the only piece left):
 
 2. An in-process map-reduce over each batch's phrases, atomically `ADD`ing
    counts into `suggestx-phrase-frequencies` (DynamoDB) — never a plain
    `PutItem`, so a redelivered/reprocessed batch increments rather than
    resets a real count.
-3. Checkpoint persistence (which key was last processed) so a restart
-   resumes instead of reprocessing everything from the start of the bucket.
+3. ~~Checkpoint persistence~~ — done (Module 3, above).
 4. Verify: post real search events, let Aggregator's cycle run, confirm
    DynamoDB counts increment correctly; re-run the same batch and confirm
-   idempotency; verify a restart resumes from the checkpoint, not from zero.
+   idempotency.
 
 ---
 
@@ -312,6 +398,38 @@ Ordered. Each phase leaves the build green **and** updates `README.md` and
 
 ## Environment notes
 
+- **LocalStack's `SERVICES` list needed `firehose,sts,iam`, not just
+  `firehose`, for an S3-destination Firehose delivery stream to actually
+  deliver.** `CreateDeliveryStream` and `PutRecord` both succeeded with
+  only `firehose` enabled, which looked like enough — the failure only
+  showed up as `Service 'sts' is not enabled` deep inside a `PutRecord`
+  call, because Firehose's S3 delivery path calls `sts:AssumeRole` against
+  the stream's configured `RoleARN` even under emulation. Worth checking
+  for with any other LocalStack service that models IAM-role-based access
+  to another service (Lambda destinations, cross-service event rules,
+  etc.) — the dependency isn't always obvious from the one API call that's
+  actually failing.
+- **DynamoDB `create-table` in the bootstrap script wasn't idempotent, and
+  this session was the first time it mattered.** LocalStack's DynamoDB data
+  survives a container restart even on the free tier (its own SQLite-backed
+  persistence, independent of the licensed Persistence feature — see the
+  note further down). Every previous restart this project happened to also
+  wipe or not touch that table; this session's `--force-recreate` while
+  testing Firehose hit it for real: `ResourceInUseException: Table already
+  exists`, non-zero exit, bootstrap script stopped before finishing.
+  **Fixed by checking `describe-table` before `create-table`** — applied
+  the same pattern proactively to the new `create-delivery-stream` call
+  too, rather than waiting to hit the identical bug there as well.
+- **LocalStack's Firehose emulation does not honor `BufferingHints
+  .IntervalInSeconds`.** Every `PutRecord` — including under a 10-request
+  concurrent burst — landed in S3 as its own separate object within about
+  a second, never combined with others from the same window. Real AWS
+  Firehose would batch these; this is purely an emulator limitation.
+  Means local testing can prove the delivery *pipeline* works (record in,
+  correct content out, durably) but cannot demonstrate the actual
+  batching/cost-reduction behavior that's the real-world reason to choose
+  Firehose over a naive one-object-per-event write. Full reasoning in
+  `DESIGN.md` decision 11.
 - **`dotnet run` launches the compiled executable as a child process — killing
   the wrapper doesn't kill the child, on Windows.** Cost a full round of
   local-debugging verification (see the Phase 2 entry above): `kill <wrapper

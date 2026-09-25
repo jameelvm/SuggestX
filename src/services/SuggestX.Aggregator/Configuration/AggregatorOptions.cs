@@ -11,4 +11,12 @@ public sealed class AggregatorOptions
     public const string SectionName = "Aggregator";
 
     public int PollIntervalSeconds { get; set; } = 15;
+
+    /// <summary>
+    /// Aggregator's exclusive DynamoDB table for its own read-progress
+    /// checkpoint — separate from suggestx-phrase-frequencies, since a
+    /// checkpoint is operational state, not a phrase count, and shouldn't
+    /// need special-casing in anything that later scans that table.
+    /// </summary>
+    public string CheckpointTable { get; set; } = "suggestx-aggregator-checkpoints";
 }

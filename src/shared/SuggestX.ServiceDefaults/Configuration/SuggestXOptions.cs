@@ -33,10 +33,11 @@ public sealed class StorageOptions
     public const string SectionName = "Storage";
 
     /// <summary>
-    /// CollectionService's exclusive store. One object per flush per instance
-    /// (see CollectionService's own doc comments once it exists) — never
-    /// rewritten, only appended-to-the-bucket, mirroring HDFS's own
-    /// write-once files.
+    /// Where Firehose delivers CollectionService's search events, under the
+    /// <c>search-events/</c> prefix — write-once objects, never rewritten,
+    /// mirroring HDFS's own write-once files. Nothing in this system writes
+    /// here directly: CollectionService publishes to Firehose and Firehose
+    /// owns the write (DESIGN.md decision 11); Aggregator only reads.
     /// </summary>
     public string RawLogsBucket { get; set; } = "suggestx-raw-logs";
 
@@ -60,6 +61,20 @@ public sealed class DynamoOptions
     public const string SectionName = "Dynamo";
 
     public string PhraseFrequenciesTable { get; set; } = "suggestx-phrase-frequencies";
+}
+
+/// <summary>
+/// The delivery stream CollectionService publishes accepted search events
+/// to. Firehose buffers them server-side and writes batched objects into
+/// <see cref="StorageOptions.RawLogsBucket"/> on its own schedule — the
+/// managed replacement for the in-memory buffer and flush worker this
+/// service used to own (DESIGN.md decision 11).
+/// </summary>
+public sealed class FirehoseOptions
+{
+    public const string SectionName = "Firehose";
+
+    public string SearchEventsStream { get; set; } = "suggestx-search-events";
 }
 
 /// <summary>

@@ -1,5 +1,6 @@
 using Amazon;
 using Amazon.DynamoDBv2;
+using Amazon.KinesisFirehose;
 using Amazon.Runtime;
 using Amazon.Runtime.Credentials;
 using Amazon.S3;
@@ -12,10 +13,9 @@ namespace SuggestX.ServiceDefaults.Aws;
 public static class AwsClientFactory
 {
     /// <summary>
-    /// Registers the two AWS clients any service here may need. Both
-    /// singletons — the SDK clients are thread-safe and hold connection
-    /// pools, so creating them per request is a known source of socket
-    /// exhaustion.
+    /// Registers the AWS clients any service here may need. All singletons —
+    /// the SDK clients are thread-safe and hold connection pools, so
+    /// creating them per request is a known source of socket exhaustion.
     /// </summary>
     public static IServiceCollection AddSuggestXAwsClients(this IServiceCollection services)
     {
@@ -29,6 +29,12 @@ public static class AwsClientFactory
 
         services.AddSingleton<IAmazonDynamoDB>(sp =>
             new AmazonDynamoDBClient(Credentials(sp), Configure(sp, new AmazonDynamoDBConfig())));
+
+        // CollectionService publishes every accepted search event here;
+        // Firehose owns the buffering and the eventual S3 write. See
+        // DESIGN.md decision 11.
+        services.AddSingleton<IAmazonKinesisFirehose>(sp =>
+            new AmazonKinesisFirehoseClient(Credentials(sp), Configure(sp, new AmazonKinesisFirehoseConfig())));
 
         return services;
     }

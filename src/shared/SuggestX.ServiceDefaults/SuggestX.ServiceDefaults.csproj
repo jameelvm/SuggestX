@@ -17,6 +17,7 @@
 
   <ItemGroup>
     <PackageReference Include="AWSSDK.DynamoDBv2" Version="4.0.103" />
+    <PackageReference Include="AWSSDK.KinesisFirehose" Version="4.0.100.14" />
     <PackageReference Include="AWSSDK.S3" Version="4.0.102" />
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.10" />
     <!-- Pinned: 10.0.10 pulls Microsoft.OpenApi 2.0.0 transitively, which carries

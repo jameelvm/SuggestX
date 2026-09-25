@@ -30,6 +30,7 @@ public static class SuggestXHostingExtensions
             .Configure<AwsOptions>(builder.Configuration.GetSection(AwsOptions.SectionName))
             .Configure<StorageOptions>(builder.Configuration.GetSection(StorageOptions.SectionName))
             .Configure<DynamoOptions>(builder.Configuration.GetSection(DynamoOptions.SectionName))
+            .Configure<FirehoseOptions>(builder.Configuration.GetSection(FirehoseOptions.SectionName))
             .Configure<ZooKeeperOptions>(builder.Configuration.GetSection(ZooKeeperOptions.SectionName));
 
         builder.Services.AddSuggestXAwsClients();

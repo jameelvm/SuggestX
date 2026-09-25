@@ -195,6 +195,12 @@ application code depends on it in Phase 4.
 
 ### Phase 2 — Collection Service (2026-09-22)
 
+> **Superseded 2026-09-25** — the in-memory buffer and flush worker
+> described below were replaced end to end by Kinesis Data Firehose. This
+> section is kept as an accurate record of what was actually built and
+> verified at the time, not silently rewritten; see the entry further down
+> for what replaced it and why.
+
 Built the first real piece of the pipeline: the write path that turns a
 user's search into durable evidence. `POST /search-events` validates and
 buffers a submitted search term in memory (`ISearchEventBuffer`); a
@@ -230,6 +236,68 @@ every field correct on inspection; a second flush cycle produced a second,
 distinct object rather than overwriting the first; an idle interval produced
 no object at all; the shutdown-flush test above produced a third object
 containing exactly the one event that was in flight.
+
+### Collection Service rebuilt on Kinesis Data Firehose (2026-09-25)
+
+The in-memory buffer/flush-worker design above had one gap it could never
+close, acknowledged honestly rather than hidden: an *ungraceful* kill of
+CollectionService (a crash, OOM, `SIGKILL`) lost whatever was buffered since
+the last flush, because durability lived only in that one process's RAM.
+Closing that gap for real meant moving durability out of the process
+entirely — not writing a bigger retry loop around the same design.
+
+**What changed:** `POST /search-events` now calls `PutRecordAsync` against
+a Kinesis Data Firehose delivery stream (`suggestx-search-events`) and does
+not return `202` until Firehose has durably accepted the record. Firehose
+itself buffers records and batch-writes them into `suggestx-raw-logs` —
+`SearchEventBuffer` and `SearchEventFlushWorker` are deleted, not
+deprecated; CollectionService now owns no store and holds no state. A
+publish failure returns `503`, not a silent drop, so the caller — not this
+service — decides whether to retry.
+
+**SQS was considered and rejected**, genuinely the more natural fit for
+this codebase's own conventions (it's the pattern the sibling JameX project
+already uses for durability). It lost specifically because the problem here
+— buffer records, batch-write them to S3 — is Firehose's literal job
+description, not a general work queue being repurposed. Choosing SQS would
+have meant re-writing the same flush-worker logic just built, reading from
+a durable queue instead of an in-memory one; Firehose removes that class of
+code entirely rather than hardening it.
+
+**A real LocalStack limitation, found by testing, not assumed either way:**
+`BufferingHints.IntervalInSeconds` (10s here — AWS's real minimum for an S3
+destination is 60s, already a demo-scale value) is not honored by
+LocalStack's Firehose emulation at all. A 10-request concurrent burst
+produced 10 separate S3 objects, not one combined one — every `PutRecord`
+lands in S3 as its own object within about a second regardless of the
+configured interval. This doesn't break correctness (Aggregator's
+line-by-line parser handles one-line objects exactly as well as many-line
+ones), but it means local testing can prove the delivery *pipeline* works —
+accept, durably hand off, land in S3 with correct content — without being
+able to demonstrate the batching/cost-reduction behavior that's the actual
+real-world reason to prefer Firehose over one-object-per-event. That
+specific claim is asserted from AWS's own documented behavior, not
+something this local stack could verify either way.
+
+**A real compatibility question, answered rather than assumed:** would
+Aggregator's `ListObjectsV2`/`StartAfter` checkpoint logic — built against
+CollectionService's own flat, timestamp-prefixed keys — still work against
+Firehose's completely different `search-events/yyyy/MM/dd/HH/stream-
+timestamp-uuid` key format? Tested directly: restarted Aggregator against
+14 pre-existing Firehose-delivered objects and it caught up on all 14 in
+one poll cycle; one more posted event moved the counters by exactly 1, not
+15. No code changes needed — S3's lexicographic listing order still
+correlates with chronological order at the hour-folder level, which is all
+the checkpoint actually depends on.
+
+**Verified against the live stack, end to end, through the Gateway**: valid
+posts return `202` and a published-event counter increments; a blank query
+is still rejected with `400`; a request through the Gateway's real proxy
+route succeeds identically to a direct call; posted events appear in S3
+under `search-events/...` with correct JSON content after the buffering
+interval; a 10-event concurrent burst delivered every event correctly; and
+Aggregator — built in Phase 3 against the *old* key format — read every one
+of them without modification.
 
 ## Next up
 
