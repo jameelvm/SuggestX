@@ -5,8 +5,9 @@
 Say this to Claude at the start of the next session:
 
 > Read PROGRESS.md and CLAUDE.md in C:\System Design\TypeheadSuggestion\App,
-> then start Phase 4 — Trie data structure + Trie Builder. Build it in short
-> modules, pausing after each one so I can review before you continue.
+> then continue Phase 4 — Trie Builder, Module 2 (flatten prefix → top-N
+> into Redis). Build it in short modules, pausing after each one so I can
+> review before you continue.
 
 **Build in short modules.** One concept per module, verified and explained
 before moving on — same discipline as JameX.
@@ -33,7 +34,7 @@ state* and *Next up* sections at the end of every session.
 
 ## Current state
 
-**Last updated:** 2026-09-25
+**Last updated:** 2026-09-26
 **Phase 1 — local substrate. Complete, verified.**
 **Phase 2 — Collection Service. Complete, verified — and since rebuilt on
 Kinesis Data Firehose** in place of the original in-memory buffer/flush
@@ -46,6 +47,11 @@ new raw logs on a timer, the actual map-reduce into
 `suggestx-phrase-frequencies` (case-insensitive, atomic `ADD`, one write per
 unique phrase per batch), and durable checkpoint persistence in DynamoDB —
 proven across a genuine container restart, not just a fresh start.
+**Phase 4 — Trie Builder. Module 1 (the compressed trie itself, built from
+real DynamoDB data) complete, verified against real branching data — a
+shared-prefix split ("java" vs "jazz"), frequency ranking, alphabetical
+tie-breaking, case normalization, and a true negative all confirmed live.
+Module 2 (flatten into Redis) next.**
 **Local debugging (cross-cutting, not a phase) — set up and verified.**
 Every service can now run under the Visual Studio debugger, on the exact
 port its container publishes, with the Gateway automatically reaching
@@ -403,19 +409,69 @@ correct, not an oversight.
       errors across the entire sequence, confirmed against the full
       container log, not just the absence of an error status code.
 
+- [x] **Phase 4 Module 1 — the compressed trie itself, built from real
+      data.** `TrieNode`/`CompressedTrie` (`Domain/`): insertion is
+      plain, uncompressed, one character per node — the doc presents
+      compression as a distinct transformation over an already-built
+      trie, not part of insertion itself, and splitting an existing
+      multi-character segment mid-insert would be real extra complexity
+      this two-phase approach (insert everything, then compress once)
+      avoids entirely. `Compress` merges chains of single-child,
+      **non-terminal** nodes into one multi-character segment — a
+      terminal node is never merged past even with exactly one child,
+      since it has to stay individually addressable (e.g. "CAT" is
+      terminal but still has a child continuing to "CATS").
+      `GetTopMatches(prefix, limit)` walks to the node a prefix lands on
+      — handling a prefix that ends *partway through* a compressed
+      segment, not just at a node boundary — then collects every
+      descendant terminal and sorts by frequency descending, phrase
+      alphabetically ascending as a deterministic tie-break.
+
+      `DynamoPhraseFrequencyReader` (`Services/`) does a full `Scan` of
+      `suggestx-phrase-frequencies` every build cycle (not an
+      incremental/checkpointed read like Aggregator's — a trie rebuild
+      needs the complete current dataset, not a delta), applying the
+      now-familiar null-vs-empty defensiveness to `Items` and
+      `LastEvaluatedKey` proactively this time, rather than hitting that
+      bug a third time. `TrieBuildWorker` (`Jobs/`, a `BackgroundService`
+      on `TrieBuilder:BuildIntervalSeconds`, default 20s) reads, builds,
+      and publishes a finished trie via `ITrieHolder` — a reader can only
+      ever see a previous complete trie or a new complete trie, never a
+      partially-built one, the same blue/green principle as decision 8
+      applied in-process instead of across Redis versions.
+      `TrieBuilderDebugController` exposes `GET /_debug/status` and, more
+      usefully, `GET /_debug/search?prefix=&limit=` — a direct line to
+      the real `GetTopMatches` logic against real data, since nothing
+      else can observe the trie working until SuggestionService exists in
+      Phase 5.
+
+      **Verified against the live stack, with real, non-trivial data —
+      not a toy example:** seeded 7 phrases through the real pipeline
+      (`guitar lesson`, `guitar solo`, `guitar chords`, `java tutorial`,
+      `jazz age`, `jazz piano` ×6, `python programming`), producing a
+      10-then-11-node compressed trie for 6-then-7 phrases. Confirmed via
+      `_debug/search`: `"jazz"` returned both jazz phrases correctly
+      ranked by frequency (piano, freq 6, before age, freq 1); `"ja"` —
+      landing exactly on the branch point between "java" and "jazz" —
+      correctly returned all three java/jazz phrases; `"guitar"` returned
+      all three guitar phrases tied at frequency 1, broken alphabetically
+      (chords, lesson, solo); `"xyz"` correctly returned no results, not
+      an error; `"JAZZ"` (uppercase) returned the identical result to
+      `"jazz"`, confirming prefix normalization. Posting one more event
+      (`guitar chords`) and waiting a full cycle moved the trie from 6→7
+      phrases and correctly added it to `"guitar"`'s results — proving the
+      periodic rebuild genuinely picks up new data, not just that the
+      first build worked.
+
 ### In progress
 
-Nothing — Phase 3 is complete. Awaiting go-ahead to start Phase 4
-(Trie data structure + Trie Builder).
+Nothing — Module 1 verified. Awaiting go-ahead for Module 2 (flatten
+`prefix → top-N` into Redis).
 
 ### Next up (immediate)
 
-**Phase 4 — Trie data structure + Trie Builder.** Proposed module
-breakdown (to confirm/adjust with the owner before starting):
+**Phase 4 — Trie data structure + Trie Builder**, continued:
 
-1. A compressed trie data structure in memory (merge single-child chains —
-   see `DESIGN.md` §1 decision 2's Q&A entry on trie traversal time),
-   built by reading every row of `suggestx-phrase-frequencies` on a timer.
 2. Walk the trie once per build cycle to precompute `prefix → top-N` for
    every prefix up to a bounded length (decision 6's configurable cap),
    and write that flattened projection into Redis under a new version
@@ -445,9 +501,10 @@ Ordered. Each phase leaves the build green **and** updates `README.md` and
 3. ~~Aggregator~~ — done. S3 raw logs → DynamoDB frequency table, durably
    checkpointed batch worker, all verified live including across a real
    container restart.
-4. **Trie data structure + Trie Builder** — compressed trie in memory, top-N
-   flattening into Redis, S3 snapshot for recovery, ZooKeeper blue/green
-   version swap. Not started.
+4. **Trie data structure + Trie Builder** — compressed trie in memory (done,
+   Module 1, verified against real branching data), top-N flattening into
+   Redis, S3 snapshot for recovery, ZooKeeper blue/green version swap
+   (Modules 2–3, not started).
 5. **Suggestion Service** — read path: ZooKeeper partition/version lookup →
    Redis `GET` → top-N response. Not started.
 6. **Gateway + frontend** — YARP routing, a real debounced search box, an
