@@ -543,6 +543,55 @@ considered, and why this one won.
     fixed by `docker compose up -d`, and left in the verification record
     rather than quietly retried away.
 
+20. **The insights panel polls every `/_debug/status` endpoint already
+    built across every service, plus one new one, rather than building
+    any new instrumentation.** Two Gateway routes were added
+    (`/api/aggregator/{**catch-all}`, `/api/trie-builder/{**catch-all}`)
+    since Aggregator and TrieBuilder never had a caller-facing API before
+    this — only debug endpoints nothing reached through the Gateway yet.
+    `TrieBuilder` gained exactly one new endpoint, `GET /_debug/tree`
+    (`CompressedTrie.ToSnapshot`), a full, unbounded JSON dump of the
+    live in-memory trie — fine at this project's demo scale (a few dozen
+    nodes at most), explicitly not something a production system would
+    expose this way at real scale, the same documented simplification as
+    the full DynamoDB `Scan` in `DynamoPhraseFrequencyReader`.
+
+    The graph itself is hand-rolled SVG, not a charting library — a
+    standard small-tree layout (leaf-counter for position, parent sits at
+    its children's midpoint), genuinely simple at this project's node
+    count, and pulling in a real dependency for it would be exactly the
+    unnecessary abstraction this project's own conventions warn against.
+    Segments label the *edge* into a node, not the node itself, mirroring
+    the compressed trie's own actual shape: a segment is what's consumed
+    to reach a node, not a property of the node in isolation.
+
+    **A real ESLint finding, not a style nit:** the newer
+    `react-hooks/refs` rule caught `usePolling` writing to a ref *during
+    render* — the common pre-Compiler "latest callback ref" idiom, now
+    flagged. Fixed by moving that assignment into its own
+    dependency-free `useEffect`, the React-recommended way to keep a ref
+    current without touching it in the render body itself.
+
+    **Verified against the live stack with two separate browser tabs —
+    one driving the pipeline, one only ever polling and never
+    reloaded — specifically to prove the panel is genuinely live, not a
+    snapshot re-fetched on navigation:** confirmed the graph rendered
+    real data with real branching (the actual "jame → el → jameel" and
+    "pia → no → piano → read → piano read" compressed-node chains this
+    session's own accumulated test data happened to contain, not a
+    contrived example). Submitted a brand-new phrase in the second tab;
+    without touching the first tab at all, its own 2s poll picked up
+    every change on its own — published/processed counters incrementing,
+    the trie's phrase and node counts increasing, and a real new node
+    appearing in the graph. Also noticed and deliberately left as an
+    honest artifact, not "fixed": `SuggestionService`'s serving version
+    briefly trailed `TrieBuilder`'s by one cycle during the same
+    observation — a small, real, visible instance of decision 16's own
+    accepted polling-driven staleness, not a bug to chase down. Found and
+    fixed one real rendering bug along the way: long terminal labels
+    clipping against the SVG viewBox's edge, fixed by padding the
+    viewBox for label width, not just node position.
+
 ## §2 Failure-mode table
 
 | Failure | Effect without mitigation | Mitigation in this build |
@@ -744,8 +793,8 @@ build specifically (not left abstract).
 | Collection service | 5 | `src/services/SuggestX.CollectionService/` | `POST /search-events` validates and publishes to the `suggestx-search-events` Firehose delivery stream, awaiting durable acceptance before returning 202. Owns no store, holds no state. Phase 2, complete; the original in-memory buffer/flush-worker design was replaced by decision 11. |
 | Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | `RawLogPollingWorker` reads new `suggestx-raw-logs` objects on a timer via a sortable-key checkpoint, durably persisted in `suggestx-aggregator-checkpoints` (DynamoDB). `IPhraseFrequencyWriter` maps and reduces each batch's phrases into atomic `ADD`s against `suggestx-phrase-frequencies`, case-insensitive. Phase 3, complete (Modules 1–3). |
 | Trie builder | 5 | `src/services/SuggestX.TrieBuilder/` | `TrieBuildWorker` reads all of `suggestx-phrase-frequencies` on a timer and builds a fresh `CompressedTrie` (Phase 4 Module 1, verified against real branching data via `GET /_debug/search`), flattens it to `prefix → top-N` and publishes a new versioned namespace into Redis via `RedisFlattenedCachePublisher` (Phase 4 Module 2, decision 14), then persists that same content to S3 (`S3TrieSnapshotStore`) and flips a ZooKeeper `current_version` znode (`ZooKeeperVersionPublisher`) — only after Redis already has it live — so a restart recovers the last published version instead of resetting to 1 (Phase 4 Module 3, decision 15, verified across a real container restart). Phase 4 is now complete. |
-| Web servers / entry point | 3 | `src/services/SuggestX.Gateway/` | YARP proxy, two routes (`/api/suggestions`, `/api/search-events`) live; no auth layer, since the source doc has no identity concept at all. |
-| Client (the doc's implicit browser/app calling both APIs) | 2, 5 | `web/` | Hand-written Next.js 16 App Router app (not CLI-scaffolded — see decision 18), mirroring JameX's own `web/` conventions. `SearchBox` debounces input (`useDebouncedValue`, 300ms) and calls `GET /api/suggestions` through the Gateway (Phase 6 Module 1); submitting a search (Enter or picking a suggestion) calls `POST /api/search-events` (Module 2, decision 19), the first time in the project a single browser action was watched flowing through the entire pipeline and back. Both verified live in a real browser. |
+| Web servers / entry point | 3 | `src/services/SuggestX.Gateway/` | YARP proxy, four routes live: `/api/suggestions`, `/api/search-events` (Phase 1), plus `/api/aggregator` and `/api/trie-builder` (Phase 6 Module 3, decision 20 — debug-only, for the insights panel, both services' first caller-facing route of any kind). No auth layer, since the source doc has no identity concept at all. |
+| Client (the doc's implicit browser/app calling both APIs) | 2, 5 | `web/` | Hand-written Next.js 16 App Router app (not CLI-scaffolded — see decision 18), mirroring JameX's own `web/` conventions. `SearchBox` debounces input (`useDebouncedValue`, 300ms) and calls `GET /api/suggestions` through the Gateway (Module 1); submitting a search calls `POST /api/search-events` (Module 2, decision 19); `/insights` polls every service's `/_debug/status` plus TrieBuilder's new `/_debug/tree` every 2s and renders a real SVG graph of the live trie (Module 3, decision 20). All verified live in a real browser. |
 | HDFS | 4, 5 | `suggestx-raw-logs` (S3, LocalStack), written by the `suggestx-search-events` Firehose delivery stream, not directly by a service | `infra/localstack/init/01-bootstrap.sh`. See decision 3 (why S3) and decision 11 (why Firehose writes it instead of CollectionService). |
 | Cassandra | 4, 5 | `suggestx-phrase-frequencies` (DynamoDB, LocalStack) | Same script. See decision 3. |
 | MongoDB (trie doc store) | 5 | `suggestx-trie-snapshots` (S3, LocalStack) | Same script. See decision 3 — S3, not a document store, deliberately. |

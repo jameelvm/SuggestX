@@ -79,6 +79,25 @@ expensive part of "trie" — traversal — gets paid for once per aggregation
 cycle by one service, not once per keystroke by every user on earth. See
 `DESIGN.md` §1 decision 2 and the "trie traversal time" Q&A entry.
 
+## Screenshots
+
+The real, running frontend (Phase 6) — not a mockup. Both were captured
+live against the actual Docker Compose stack.
+
+**Search** — the debounced search box (`web/`), calling `GET
+/api/suggestions` through the Gateway and rendering whatever Redis
+actually returns:
+
+![Search page showing debounced suggestions for "guitar"](docs/screenshots/search.jpg)
+
+**Insights** — `/insights`, polling every service's `/_debug/status`
+plus TrieBuilder's `/_debug/tree` every 2 seconds, including a real SVG
+graph of the live compressed trie (segments label edges, not nodes —
+terminal nodes are the green dots labelled with the phrase they
+complete):
+
+![Insights page showing live pipeline stats and a graphical trie](docs/screenshots/insights.jpg)
+
 ## Resource estimates the design targets
 
 Carried straight from the source doc's Requirements chapter, since they're

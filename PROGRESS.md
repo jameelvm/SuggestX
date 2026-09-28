@@ -5,12 +5,11 @@
 Say this to Claude at the start of the next session:
 
 > Read PROGRESS.md and CLAUDE.md in C:\System Design\TypeheadSuggestion\App,
-> then continue Phase 6 — Gateway + frontend. Modules 1-2 (debounced
-> search box, submitting a search into the write pipeline) are done and
-> verified live, including a full pipeline round trip watched from a
-> single browser action. Next is an insights panel. Build in short
-> modules, pausing after each one so I can review before
-> you continue.
+> then start Phase 7 — evaluation extras (personalization, remaining
+> client-side optimizations, fault-tolerance verification). Phase 6 is
+> fully complete, including a real-time insights panel with a graphical
+> trie view. Build in short modules, pausing after each one so I can
+> review before you continue.
 
 **Build in short modules.** One concept per module, verified and explained
 before moving on — same discipline as JameX.
@@ -71,18 +70,18 @@ TrieBuilder's Redis cleanup roll past the version SuggestionService is
 still frozen on — accepted as a documented, bounded gap (decision 17)
 rather than closed. Real latency measured end to end: p95 well under
 10ms on every path tested, comfortably inside the doc's 200ms NFR.**
-**Phase 6 — Gateway + frontend. Modules 1-2 complete, verified live in a
-real Chrome browser.** Module 1: a real, hand-written Next.js app with a
-debounced search box — confirmed via network inspection that debounce
-genuinely collapses many keystrokes into one request, the decision-6
-over-bound fallback renders correctly, zero console errors after fixing
-the Gateway's CORS origins (still listed JameX's ports before this
-module actually needed them corrected). Module 2: submitting a search
-(Enter or picking a suggestion) now fires `POST /api/search-events`,
-closing the loop — watched a single browser action for a brand-new
-phrase flow through every stage of the real pipeline (S3 → DynamoDB →
-Redis) and reappear as a genuine suggestion in the same browser tab,
-with no restart anywhere. An insights panel is next.**
+**Phase 6 — Gateway + frontend. Complete, verified live — all three
+modules.** Module 1: a real, hand-written Next.js app with a debounced
+search box. Module 2: submitting a search (Enter or picking a
+suggestion) fires `POST /api/search-events`, closing the loop — watched
+a single browser action for a brand-new phrase flow through every stage
+of the real pipeline and reappear as a genuine suggestion in the same
+browser tab. Module 3: a real-time insights panel with a genuine SVG
+graph of TrieBuilder's own live trie — watched, in a second browser tab
+that was never reloaded, real numbers and a real new graph node appear
+within seconds of submitting a search in the first tab. New Gateway
+routes expose Aggregator/TrieBuilder for the first time. Phase 7
+(evaluation extras) next.**
 **Local debugging (cross-cutting, not a phase) — set up and verified.**
 Every service can now run under the Visual Studio debugger, on the exact
 port its container publishes, with the Gateway automatically reaching
@@ -794,20 +793,83 @@ correct, not an oversight.
       first time in the whole project a single user action was watched
       flowing through every stage of the pipeline end to end.
 
+- [x] **Phase 6 Module 3 — a real-time insights panel, including a
+      genuine graphical rendering of TrieBuilder's own trie structure.**
+      Two Gateway routes were added (`/api/aggregator/{**catch-all}`,
+      `/api/trie-builder/{**catch-all}` → new `aggregator`/`trieBuilder`
+      clusters at `9083`/`9084`) — `/api/suggestions` and
+      `/api/search-events` already existed from Phase 1, but Aggregator
+      and TrieBuilder never had a real caller-facing API of their own
+      before, only debug endpoints nothing reached through the Gateway
+      yet.
+
+      TrieBuilder gained one new endpoint, `GET /_debug/tree`
+      (`CompressedTrie.ToSnapshot`/`TrieNodeSnapshot`) — a full,
+      JSON-serializable dump of the live in-memory trie, deliberately
+      unbounded (fine at this project's demo scale, explicitly not
+      something a production system would expose this way at real scale,
+      the same "toy-scale simplification, documented" pattern as the
+      full DynamoDB `Scan`).
+
+      `web/src/app/insights/page.tsx` polls five endpoints every 2s
+      (`usePolling`, a small reusable hook) — Collection, Aggregator,
+      TrieBuilder, and SuggestionService's own existing `/_debug/status`
+      endpoints for live counters, plus the new `/_debug/tree` for the
+      graph. `TrieGraph` (`components/insights/trie-graph.tsx`) is a
+      hand-rolled SVG tree renderer — a standard small-tree layout
+      (leaf-counter + parent-midpoint), not a charting library, since
+      this project's trie never has more than a few dozen nodes at demo
+      scale. Segments label the *edge* into a node, not the node itself —
+      the same distinction the trie's own compression makes (a segment is
+      what's consumed to reach a node). Terminal nodes are marked and
+      labelled with the phrase they complete.
+
+      **A real ESLint finding, not a style nit:** the newer
+      `react-hooks/refs` rule caught `usePolling` writing to a ref
+      *during render* (the common pre-Compiler "latest callback ref"
+      idiom) — fixed by moving that assignment into its own
+      dependency-free `useEffect`, the React-recommended pattern for
+      keeping a ref current without touching it in the render body.
+
+      **Verified against the live stack, watching two separate browser
+      tabs — one driving the pipeline, one only ever polling, never
+      reloaded — to prove the panel is genuinely live, not a snapshot
+      re-fetched on navigation:** opened `/insights` once, confirmed real
+      numbers (13 phrases, 18 nodes, a correctly rendered graph including
+      the real "jame → el → jameel" and "pia → no → piano → read → piano
+      read" compressed-node chains this exact live data happened to
+      contain). In a second tab, submitted a brand-new phrase (`ukulele
+      chords`) on the search page. Without touching the still-open
+      insights tab at all, its own 2s poll picked up every change on its
+      own: Collection's published count 19→20, Aggregator's
+      batches/entries processed 19→20, TrieBuilder's version 183→188 and
+      phrase count 13→14, and the graph itself grew a real new `ukulele
+      chords (1)` node — watched, not inferred from logs. Also noticed
+      and left as an honest artifact, not "fixed": `SuggestionService`'s
+      serving version briefly trailed `TrieBuilder`'s by one cycle (187
+      vs. 188) during the same observation — a small, real, visible
+      instance of decision 16's own accepted polling-driven staleness,
+      not a bug. Found and fixed one viewBox padding bug along the way
+      (long terminal labels clipping against the SVG edge). Zero console
+      errors. `npm run build` and `npx eslint .` both pass clean.
+
+**Phase 6 is now complete — all three modules.**
+
 ### In progress
 
-Nothing — Phase 6 Modules 1 and 2 verified live in a real browser,
-including one full round trip through the entire pipeline from a single
-user action.
+Nothing — Phase 6 fully verified: the search box, submitting a search,
+and the real-time insights panel with a live trie graph, all confirmed
+live in a real browser.
 
 ### Next up (immediate)
 
-**Phase 6 — Gateway + frontend**, continued:
-
-3. An insights panel showing live system state: current trie version,
-   flattened prefix count, aggregation lag — surfacing the various
-   `/_debug/status` endpoints already built across every service rather
-   than building new instrumentation from scratch.
+**Phase 7 — Evaluation extras**, not started: personalization
+(blend client-cached recent searches with global ranking), remaining
+client-side optimizations beyond debounce (input threshold, local cache,
+early connection, edge-cache headers), and fault-tolerance verification
+(deliberately killing ZooKeeper/Redis/TrieBuilder mid-cycle and
+confirming the failure-mode table's mitigations — and its one corrected,
+not-fully-mitigated row, decision 17 — actually hold as documented).
 
 ---
 
@@ -833,17 +895,19 @@ Ordered. Each phase leaves the build green **and** updates `README.md` and
    top-N response, verified live including the decision-6 over-bound
    fallback, real sub-10ms-p95 latency, and a real ZooKeeper-outage gap
    found live and accepted as documented (decision 17).
-6. **Gateway + frontend** — YARP routing (done, Phase 1), a real,
-   hand-written Next.js debounced search box (done, Module 1), and
-   submitting a search into the write pipeline (done, Module 2) — all
-   verified live in a browser, including a full pipeline round trip from
-   a single browser action. An insights panel showing live trie
-   version/aggregation state remains.
+6. ~~Gateway + frontend~~ — done. YARP routing (Phase 1), a real,
+   hand-written Next.js debounced search box (Module 1), submitting a
+   search into the write pipeline (Module 2), and a real-time insights
+   panel with a graphical trie view (Module 3) — all verified live in a
+   browser, including a full pipeline round trip from a single browser
+   action watched updating a second, never-reloaded tab.
 7. **Evaluation extras** — personalization (blend client-cached recent
-   searches with global ranking), client-side optimizations (debounce, input
-   threshold, early connection, edge-cache headers), fault-tolerance
-   verification (kill ZooKeeper/a Redis partition/TrieBuilder mid-cycle and
-   confirm the failure-mode table's mitigations actually hold). Not started.
+   searches with global ranking), client-side optimizations beyond
+   debounce (input threshold, early connection, edge-cache headers),
+   fault-tolerance verification (kill ZooKeeper/a Redis partition/
+   TrieBuilder mid-cycle and confirm the failure-mode table's
+   mitigations — and decision 17's corrected, not-fully-mitigated row —
+   actually hold as documented). Not started.
 
 ---
 

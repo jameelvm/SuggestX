@@ -220,4 +220,34 @@ public sealed class CompressedTrie
             foreach (var child in node.Children.Values) Count(child);
         }
     }
+
+    /// <summary>
+    /// Dumps the whole tree as a plain, JSON-serializable snapshot for
+    /// `GET /_debug/tree` — the frontend's insights panel renders this as
+    /// an actual graph, not just counts. A full dump, not a bounded one:
+    /// fine at this project's demo scale (a few dozen nodes at most), and
+    /// deliberately not something a production system would expose this
+    /// way at real scale — the same "toy-scale simplification, documented,
+    /// not silently assumed to generalize" pattern as the full DynamoDB
+    /// `Scan` in <c>DynamoPhraseFrequencyReader</c>.
+    /// </summary>
+    public TrieNodeSnapshot ToSnapshot() => Snapshot(_root);
+
+    private static TrieNodeSnapshot Snapshot(TrieNode node) => new(
+        node.Segment,
+        node.IsTerminal,
+        node.Phrase,
+        node.Frequency,
+        node.Children.Values
+            .OrderBy(c => c.Segment, StringComparer.Ordinal)
+            .Select(Snapshot)
+            .ToList());
 }
+
+/// <summary>Plain, dependency-free mirror of <see cref="TrieNode"/> for JSON serialization — never used on the read/write path, debug-only.</summary>
+public sealed record TrieNodeSnapshot(
+    string Segment,
+    bool IsTerminal,
+    string? Phrase,
+    long Frequency,
+    IReadOnlyList<TrieNodeSnapshot> Children);

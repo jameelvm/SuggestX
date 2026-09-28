@@ -144,6 +144,8 @@ services:
       # the usual two-destination failover pattern.
       ReverseProxy__Clusters__suggestionService__Destinations__instance__Address: "http://suggestx-host:9081/"
       ReverseProxy__Clusters__collectionService__Destinations__instance__Address: "http://suggestx-host:9082/"
+      ReverseProxy__Clusters__aggregator__Destinations__instance__Address: "http://suggestx-host:9083/"
+      ReverseProxy__Clusters__trieBuilder__Destinations__instance__Address: "http://suggestx-host:9084/"
 
   suggestion-service:
     <<: *service-base

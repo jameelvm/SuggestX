@@ -46,4 +46,20 @@ public sealed class TrieBuilderDebugController(ITrieHolder trieHolder, ITrieBuil
             results = matches.Select(m => new { phrase = m.Phrase, frequency = m.Frequency })
         });
     }
+
+    /// <summary>
+    /// The whole current trie, structurally — for the insights panel's
+    /// graphical rendering (Phase 6 Module 3), not for anything on the
+    /// read/write path. See <c>CompressedTrie.ToSnapshot</c> for why a
+    /// full dump is fine here and not something a production system would
+    /// do the same way at real scale.
+    /// </summary>
+    [HttpGet("tree")]
+    public IActionResult Tree()
+    {
+        var trie = trieHolder.Current;
+        if (trie is null) return Ok(new { built = false, root = (object?)null });
+
+        return Ok(new { built = true, root = trie.ToSnapshot() });
+    }
 }
