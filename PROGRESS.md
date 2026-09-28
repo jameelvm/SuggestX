@@ -5,10 +5,8 @@
 Say this to Claude at the start of the next session:
 
 > Read PROGRESS.md and CLAUDE.md in C:\System Design\TypeheadSuggestion\App,
-> then continue Phase 5 — Suggestion Service. Module 1 (the real read path)
-> is done and verified; decide with me whether to close the ZooKeeper-outage
-> gap found during verification (decision 17) before moving on. Build in
-> short modules, pausing after each one so I can review before you continue.
+> then start Phase 6 — Gateway + frontend. Build it in short modules,
+> pausing after each one so I can review before you continue.
 
 **Build in short modules.** One concept per module, verified and explained
 before moving on — same discipline as JameX.
@@ -60,13 +58,16 @@ restart: the restarted process recovered version 3 from ZooKeeper (not a
 reset to 1), published version 4 next, and correctly cleaned up exactly
 version 3's Redis keys — proven directly against Redis, S3, and ZooKeeper,
 not inferred from logs alone.
-**Phase 5 — Suggestion Service. Module 1 (the real read path) complete,
-verified live** — including a real, previously-undocumented gap found by
-testing the ZooKeeper-outage claim directly rather than trusting it: a
-long enough ZooKeeper outage lets TrieBuilder's Redis cleanup roll past
-the version SuggestionService is still frozen on, briefly serving empty
-results rather than merely stale ones. See decision 17 — not yet closed,
-open for discussion before continuing.**
+**Phase 5 — Suggestion Service. Complete, verified live.** The real read
+path (ZooKeeper version poll → Redis `GET` → decision-6 over-bound
+fallback) verified against `guitar`/`jazz`/`ja` and through the real
+Gateway proxy. A real gap found by testing the ZooKeeper-outage failure
+mode directly rather than trusting it — a long enough outage lets
+TrieBuilder's Redis cleanup roll past the version SuggestionService is
+still frozen on — accepted as a documented, bounded gap (decision 17)
+rather than closed. Real latency measured end to end: p95 well under
+10ms on every path tested, comfortably inside the doc's 200ms NFR.
+Phase 6 (Gateway + frontend) next.**
 **Local debugging (cross-cutting, not a phase) — set up and verified.**
 Every service can now run under the Visual Studio debugger, on the exact
 port its container publishes, with the Gateway automatically reaching
@@ -652,23 +653,57 @@ correct, not an oversight.
 
 ### In progress
 
-Nothing — Phase 5 Module 1 verified, including a real gap found and
-documented (decision 17). Not yet closed — see DESIGN.md §4.
+- [x] **Phase 5 — decision: accept the ZooKeeper-outage gap (decision 17)
+      as a documented, bounded limitation** rather than build either
+      candidate fix (pausing TrieBuilder's Redis cleanup during an outage,
+      or giving SuggestionService a way to distinguish "should have data"
+      from a genuine no-match). Consistent with decisions 9/13's standing
+      pattern: a rare, self-healing, well-understood gap doesn't get
+      defensive machinery built around it just because it's real.
+
+- [x] **Phase 5 — real latency measurement**, not manual `curl` timing.
+      200 sequential requests for a real, matching prefix (`guitar`)
+      against `SuggestionService` directly: p50 4.08ms, p95 6.60ms, p99
+      23.37ms, max 28.41ms, avg 4.96ms. The same 200 requests through the
+      real Gateway proxy (`/api/suggestions`, the actual client-facing
+      path): p50 6.63ms, p95 9.93ms, p99 22.91ms, max 29.76ms, avg
+      7.67ms — a consistent, small (~2-3ms) proxy hop overhead, nothing
+      surprising. 100 requests against the over-bound fallback path
+      (`guitar lesso`, past the 6-character bound, exercising the
+      truncate-fetch-filter logic) averaged 4.17ms, essentially identical
+      to the direct-match cost — confirming the in-process filter really
+      is the trivial O(≤`TopN`) operation decision 16 claimed, not a
+      hidden cost. Every measured percentile, on every path, comfortably
+      inside the doc's own "under 200ms" NFR — this was real end-to-end
+      request latency through the actual running stack (Kestrel → Redis
+      round trip → JSON serialization → Gateway proxy where applicable),
+      not a synthetic microbenchmark.
+
+**Phase 5 is now complete.**
+
+### In progress
+
+Nothing — Phase 5 fully verified: read path, the ZooKeeper-outage gap
+decision, and real latency numbers.
 
 ### Next up (immediate)
 
-**Phase 5 — Suggestion Service**, continued:
+**Phase 6 — Gateway + frontend**, not started:
 
-2. Decide whether the ZooKeeper-outage gap (decision 17) is worth closing
-   here — e.g. TrieBuilder pausing its own Redis cleanup (not its
-   publish) while it can't reach ZooKeeper, or SuggestionService treating
-   an empty Redis read for a *known-populated* prefix as a signal to
-   re-poll immediately rather than waiting a full interval — or accepted
-   as a documented, bounded gap the way decisions 9/13 were.
-3. Latency measurement under real (if small-scale) load — the doc's own
-   NFR is "under 200ms"; verify with more than manual `curl` timing.
-4. Gateway + frontend (Phase 6) will be the first real exercise of this
-   read path end to end from a browser.
+1. Decide the frontend's shape: a real debounced search box (client-side
+   debounce is one of the doc's own stated latency levers, not yet built
+   anywhere in this system) calling `GET /api/suggestions?prefix=` through
+   the Gateway, plus — per the doc's `addToDatabase(query)` API — firing
+   `POST /api/search-events` once a search is actually submitted, closing
+   the loop back into the write pipeline this whole system already runs.
+2. An insights panel showing live system state: current trie version,
+   flattened prefix count, aggregation lag — surfacing the various
+   `/_debug/status` endpoints already built across every service rather
+   than building new instrumentation from scratch.
+3. Verify: a real browser session, typing a prefix, sees debounced
+   requests and real suggestions; a submitted search is visible flowing
+   through Collection → Aggregator → TrieBuilder → back into
+   SuggestionService within one full pipeline cycle, watched live.
 
 ---
 
@@ -690,10 +725,10 @@ Ordered. Each phase leaves the build green **and** updates `README.md` and
    and S3 snapshot persistence + a real ZooKeeper `current_version` znode
    (Module 3), all verified against real branching data, real build
    cycles, and a genuine container restart.
-5. **Suggestion Service** — read path done (Module 1): ZooKeeper version
-   lookup → Redis `GET` → top-N response, verified live including the
-   decision-6 over-bound fallback. A real ZooKeeper-outage gap found and
-   documented (decision 17), open for a decision on whether to close it.
+5. ~~Suggestion Service~~ — done. ZooKeeper version lookup → Redis `GET` →
+   top-N response, verified live including the decision-6 over-bound
+   fallback, real sub-10ms-p95 latency, and a real ZooKeeper-outage gap
+   found live and accepted as documented (decision 17).
 6. **Gateway + frontend** — YARP routing, a real debounced search box, an
    insights panel showing live trie version/partition state and aggregation
    lag. Not started.
