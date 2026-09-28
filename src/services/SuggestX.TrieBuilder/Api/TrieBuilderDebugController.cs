@@ -13,7 +13,7 @@ namespace SuggestX.TrieBuilder.Api;
 /// </summary>
 [ApiController]
 [Route("_debug")]
-public sealed class TrieBuilderDebugController(ITrieHolder trieHolder) : ControllerBase
+public sealed class TrieBuilderDebugController(ITrieHolder trieHolder, ITrieBuildStats stats) : ControllerBase
 {
     [HttpGet("status")]
     public IActionResult Status()
@@ -23,7 +23,10 @@ public sealed class TrieBuilderDebugController(ITrieHolder trieHolder) : Control
         {
             built = trie is not null,
             phraseCount = trie?.PhraseCount ?? 0,
-            nodeCount = trie?.NodeCount ?? 0
+            nodeCount = trie?.NodeCount ?? 0,
+            currentVersion = stats.CurrentVersion,
+            flattenedPrefixCount = stats.FlattenedPrefixCount,
+            lastBuildAt = stats.LastBuildAt
         });
     }
 

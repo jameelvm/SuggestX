@@ -5,9 +5,9 @@
 Say this to Claude at the start of the next session:
 
 > Read PROGRESS.md and CLAUDE.md in C:\System Design\TypeheadSuggestion\App,
-> then continue Phase 4 — Trie Builder, Module 2 (flatten prefix → top-N
-> into Redis). Build it in short modules, pausing after each one so I can
-> review before you continue.
+> then continue Phase 4 — Trie Builder, Module 3 (S3 snapshot persistence +
+> ZooKeeper-coordinated blue/green version swap). Build it in short modules,
+> pausing after each one so I can review before you continue.
 
 **Build in short modules.** One concept per module, verified and explained
 before moving on — same discipline as JameX.
@@ -51,7 +51,10 @@ proven across a genuine container restart, not just a fresh start.
 real DynamoDB data) complete, verified against real branching data — a
 shared-prefix split ("java" vs "jazz"), frequency ranking, alphabetical
 tie-breaking, case normalization, and a true negative all confirmed live.
-Module 2 (flatten into Redis) next.**
+Module 2 (flatten `prefix → top-N` into a versioned Redis namespace) also
+complete, verified live across three real build cycles including the
+blue/green old-version cleanup. Module 3 (S3 snapshot + ZooKeeper-coordinated
+version swap) next.**
 **Local debugging (cross-cutting, not a phase) — set up and verified.**
 Every service can now run under the Visual Studio debugger, on the exact
 port its container publishes, with the Gateway automatically reaching
@@ -463,28 +466,69 @@ correct, not an oversight.
       periodic rebuild genuinely picks up new data, not just that the
       first build worked.
 
+- [x] **Phase 4 Module 2 — flatten `prefix → top-N` into a versioned Redis
+      namespace.** `CompressedTrie.FlattenPrefixes(maxPrefixLength, topN)`
+      (`Domain/CompressedTrie.cs`) walks the trie exactly once per build
+      cycle: for every child node it computes that node's own top-N
+      exactly once, then reuses the identical answer for every prefix
+      length that lands inside that node's own segment (only recomputing
+      at an actual branch point) — a prefix stopping mid-segment shares
+      the same subtree as one stopping at the segment's end, so there's
+      no reason to recompute per character. Bounded by
+      `TrieBuilder:MaxPrefixLength` (default 6, decision 6) and
+      `TrieBuilder:TopN` (default 10).
+
+      `RedisFlattenedCachePublisher` (`Services/IFlattenedCachePublisher.cs`)
+      writes the whole new version first — every `trie:v{N}:{prefix}` key,
+      JSON-serialized `SuggestionItem` list — then deletes the *exact*
+      prefix set it remembered writing last cycle under `trie:v{N-1}:*`,
+      never a `KEYS`/`SCAN` sweep. New version fully in place before the
+      old one is touched — decision 8's blue/green ordering, this time
+      across Redis versions rather than in-process. `TrieBuildWorker`
+      keeps the version counter and previous-prefix-set as private,
+      in-memory state — deliberately not yet durable, since nothing reads
+      a "current version" pointer until Module 3 introduces the
+      ZooKeeper-coordinated one. `ITrieBuildStats`/`TrieBuildStats` track
+      `CurrentVersion`/`FlattenedPrefixCount`/`LastBuildAt`, surfaced on
+      `GET /_debug/status` alongside the existing phrase/node counts.
+
+      **Verified against the live stack, across three real, consecutive
+      build cycles** (20s apart, container logs read directly, not
+      inferred): cycle 1 published version 1, 23 prefixes, 0 keys deleted
+      (nothing to clean up yet); cycles 2 and 3 each published a new
+      version, 23 prefixes, and deleted exactly the 23 keys from the
+      version before it — confirmed directly against Redis
+      (`redis-cli KEYS 'trie:*'`) that only the current version's keys
+      ever exist at once, never a mix of two versions or zero. Inspected
+      actual values, not just key presence: `trie:v3:j` and `trie:v3:ja`
+      — both landing inside the same "j" segment before the java/jazz
+      branch point — returned the byte-identical ranked JSON (jazz piano
+      freq 6, java tutorial freq 1, jazz age freq 1), confirming the
+      shared-segment reuse in `FlattenPrefixes` is real, not just
+      theoretically correct; `trie:v3:guitar` returned all three guitar
+      phrases tied at frequency 1 in the same alphabetical tie-break
+      order as Module 1; `trie:v3:python` returned its single phrase.
+      `GET /_debug/status` reported `currentVersion: 3`,
+      `flattenedPrefixCount: 23`, matching the logs and Redis exactly.
+
 ### In progress
 
-Nothing — Module 1 verified. Awaiting go-ahead for Module 2 (flatten
-`prefix → top-N` into Redis).
+Nothing — Module 2 verified. Awaiting go-ahead for Module 3 (S3 snapshot
+persistence + ZooKeeper-coordinated blue/green version swap).
 
 ### Next up (immediate)
 
 **Phase 4 — Trie data structure + Trie Builder**, continued:
 
-2. Walk the trie once per build cycle to precompute `prefix → top-N` for
-   every prefix up to a bounded length (decision 6's configurable cap),
-   and write that flattened projection into Redis under a new version
-   namespace (`trie:v{N}:{prefix}`) — not overwriting whatever
-   `SuggestionService` is currently reading.
 3. Persist a full trie snapshot to `suggestx-trie-snapshots` (S3) for
    recovery, then flip the ZooKeeper `current_version` znode for each
    partition only after the new version is fully written and validated —
-   the blue/green swap from decision 8.
-4. Verify: real frequency data flows to a real flattened Redis cache;
-   confirm a prefix that wasn't previously served starts returning results
-   after a build cycle; confirm the old version's keys are only evicted
-   after the swap succeeds, not before.
+   the blue/green swap from decision 8, made durable and coordinated
+   instead of an in-process/in-memory version counter.
+4. Verify: a TrieBuilder restart recovers the last published version from
+   S3/ZooKeeper rather than resetting to version 1; confirm the
+   ZooKeeper znode only flips after the new Redis version is fully
+   written, never before.
 
 ---
 
@@ -502,9 +546,10 @@ Ordered. Each phase leaves the build green **and** updates `README.md` and
    checkpointed batch worker, all verified live including across a real
    container restart.
 4. **Trie data structure + Trie Builder** — compressed trie in memory (done,
-   Module 1, verified against real branching data), top-N flattening into
-   Redis, S3 snapshot for recovery, ZooKeeper blue/green version swap
-   (Modules 2–3, not started).
+   Module 1) and top-N flattening into a versioned Redis namespace (done,
+   Module 2), both verified against real branching data and real build
+   cycles. S3 snapshot for recovery + ZooKeeper blue/green version swap
+   (Module 3, not started).
 5. **Suggestion Service** — read path: ZooKeeper partition/version lookup →
    Redis `GET` → top-N response. Not started.
 6. **Gateway + frontend** — YARP routing, a real debounced search box, an

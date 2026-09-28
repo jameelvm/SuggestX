@@ -267,11 +267,57 @@ considered, and why this one won.
     bounded inaccuracy in exchange for not building defensive machinery
     against failures far rarer than the thing they'd protect.
 
+14. **The trie is flattened to `prefix → top-N` once per build cycle and
+    published into Redis under a versioned key namespace
+    (`trie:v{N}:{prefix}`), with the previous version's exact keys deleted
+    only after the new version is fully written — and the version number
+    itself is a private, in-memory counter for now, not yet a durable or
+    coordinated one.** This is decision 2's central claim made concrete:
+    `SuggestionService` (Phase 5) must never traverse a trie or pay a
+    per-request lookup cost beyond one Redis `GET`, so every prefix it
+    could ever be asked for has to already have a precomputed answer
+    sitting in Redis before a request arrives.
+
+    `CompressedTrie.FlattenPrefixes` computes each node's own top-N exactly
+    once and reuses it for every prefix length that lands inside that
+    node's own (possibly multi-character) segment, only recomputing at an
+    actual branch point — a direct consequence of decision 2's compression:
+    a user who stops typing mid-segment lands on exactly the same subtree
+    as one who stops at the segment's boundary, so recomputing per
+    character would be pure waste for an answer that's already identical.
+
+    Publishing order is decision 8's blue/green principle applied to Redis
+    keys instead of an in-process object reference: write the whole new
+    version first, only then delete the old version's keys — by the exact
+    prefix set remembered from the previous cycle, not a `KEYS`/`SCAN`
+    sweep, since this service already knows precisely which keys it wrote
+    last time and scanning the keyspace to rediscover that would be real,
+    avoidable cost. Verified live across three consecutive build cycles:
+    each published a new version's full key set before removing exactly
+    the prior version's keys, so `redis-cli KEYS 'trie:*'` never showed a
+    mix of two versions or a gap with none at all.
+
+    **What this deliberately does not close yet:** the version counter and
+    the "which prefixes did the last cycle publish" set are both plain
+    in-memory fields on `TrieBuildWorker` — nothing durable or shared
+    tracks "which version is current." A TrieBuilder restart today resets
+    the counter to 1 and starts overwriting `trie:v1:*` again. This is
+    harmless right now for the same reason decision 12's checkpoint gap
+    was harmless in Module 1 before it was closed: nothing outside this
+    process reads a "current version" pointer yet, since SuggestionService
+    doesn't exist until Phase 5. Module 3 is exactly the fix — persisting
+    a trie snapshot to S3 and moving "which version is current" into a
+    ZooKeeper znode that only flips after the new version is fully
+    written and validated, mirroring how decision 12 replaced Aggregator's
+    own in-memory-only checkpoint with a durable one before anything
+    downstream needed to trust it.
+
 ## §2 Failure-mode table
 
 | Failure | Effect without mitigation | Mitigation in this build |
 |---|---|---|
 | `TrieBuilder` crashes mid-build | Partial/corrupt version could be served | Blue/green swap (decision 8): the ZooKeeper pointer only flips after the full new version is written and validated, so a crash mid-build leaves the previously-served version untouched. |
+| `TrieBuilder` restarts | Its in-memory version counter and previous-prefix-set both reset, so it starts overwriting `trie:v1:*` again | Not mitigated yet — harmless today only because nothing outside the process reads a "current version" pointer before SuggestionService exists (Phase 5). Module 3 replaces this with S3 snapshot recovery + a durable ZooKeeper version pointer. See decision 14. |
 | Aggregator falls behind (batch job takes longer than its own interval) | Frequencies grow stale, or two runs overlap and double-count | Aggregator checkpoints its S3 read offset per run; a run that overlaps the next start is a documented open question (see §4) rather than silently assumed away. |
 | Aggregator crashes between a successful frequency `ADD` and its checkpoint's durable write | A restart re-reads and re-counts that one batch, over-counting it | Not mitigated — accepted as a rare, self-bounded (at most one batch) overcount rather than adding an idempotency guard or a cross-table transaction. See decision 13. |
 | ZooKeeper unreachable | `SuggestionService` cannot learn the current version | Suggestion Service caches the last-known version/partition map in memory and continues serving it; a ZooKeeper outage degrades to "suggestions may go stale," not "suggestions stop." |
@@ -358,6 +404,47 @@ build specifically (not left abstract).
   all — matching the doc's own stated reasoning almost verbatim (scale +
   relevance-doesn't-change-that-fast).
 
+- **Q: TrieBuilder does a full `Scan` of the frequency table every cycle —
+  what would a production system do instead, at real (millions-of-phrases)
+  scale?**
+  A: A few real options, in rough order of how much they change the
+  architecture:
+  1. **Batch export instead of a live table read.** DynamoDB's own
+     `ExportTableToPointInTime` (to S3) or, for the doc's original
+     Cassandra choice, a `sstableloader`/bulk-export step, run on the same
+     cadence as the rebuild. This removes read-capacity pressure from the
+     live table entirely — the rebuild reads a snapshot file, not the
+     table itself — at the cost of the export's own latency, which usually
+     still comfortably fits a "every N minutes" rebuild cadence.
+  2. **Incremental frequency deltas instead of a full re-scan.** Have
+     Aggregator (which already writes every frequency change) also emit
+     a compact change-log — e.g. to Kinesis/SQS, or a "changed since last
+     export" marker — and have TrieBuilder fold only the deltas into its
+     existing in-memory trie rather than reading everything and rebuilding
+     from scratch. This is the option with the best steady-state read cost,
+     but it's real complexity: node merging/splitting on a targeted update
+     is a much harder algorithm than "build fresh from a full list," and
+     getting it wrong risks the trie silently drifting from the source of
+     truth in a way a full rebuild can never do (a full rebuild is
+     self-correcting by construction).
+  3. **Partition the read, not just the trie.** If the doc's own prefix-range
+     partitioning (decision/§1) is in play, each TrieBuilder partition
+     only needs to scan its own slice of the frequency table (e.g. via a
+     GSI keyed by prefix range), not the whole table — cutting the per-node
+     scan cost roughly by the partition count without needing incremental
+     logic at all.
+  4. **Widen the rebuild interval as the real lever, not just a code
+     change.** The doc itself already accepts minutes of staleness
+     (decision 7) — at real scale, the honest first move is usually
+     "scan less often," which directly trades off against how stale
+     suggestions are allowed to get, before reaching for the complexity of
+     options 1–3.
+
+  This project stays with the simple full-`Scan` approach deliberately —
+  it's correct, easy to reason about, and cheap at the data volumes this
+  build actually exercises; see the open-questions entry above for why
+  changing it is out of scope here.
+
 ## §4 Open questions / deferred
 
 - **Hot-prefix imbalance under range partitioning** — named in the doc, not
@@ -386,6 +473,24 @@ build specifically (not left abstract).
   decision 13. Not closed; a real fix needs a per-object idempotency guard
   or a cross-table transaction, both real complexity for a rare,
   self-bounded (at most one batch) overcount.
+- **TrieBuilder does a full, unfiltered `Scan` of `suggestx-phrase-frequencies`
+  every build cycle, not an incremental/delta read.** `DynamoPhraseFrequencyReader`
+  (`Services/IPhraseFrequencyReader.cs`) pages through the entire table via
+  `LastEvaluatedKey` and discards the whole in-memory result to rebuild a
+  fresh trie next cycle too — deliberate, not an oversight: a compressed
+  trie's node merging and ranking are whole-dataset computations, so a
+  delta of "what changed since last time" can't be patched into an
+  existing trie the way Aggregator patches S3 checkpoints. At this
+  project's toy scale (a handful of phrases, a 20s cycle) this is free;
+  at real scale (millions of unique phrases) a `Scan` on every cycle is
+  a genuinely expensive, slow read pattern that a production system would
+  not do this way. Not fixed here — a real fix means either read
+  volume reduction (batch export instead of a live table scan, e.g.
+  DynamoDB → S3 export) or restructuring the rebuild itself to be
+  incremental rather than full, both real complexity out of scope for a
+  project whose point is demonstrating the pipeline shape, not
+  operating it at production data volume. See §3's Q&A entry on this for
+  the production-design options actually considered.
 
 ## §5 Doc-to-code map
 
@@ -394,7 +499,7 @@ build specifically (not left abstract).
 | Suggestion service | 3, 5 | `src/services/SuggestX.SuggestionService/` | Scaffolded, health-check only so far; real Redis-`GET` read path arrives Phase 5. |
 | Collection service | 5 | `src/services/SuggestX.CollectionService/` | `POST /search-events` validates and publishes to the `suggestx-search-events` Firehose delivery stream, awaiting durable acceptance before returning 202. Owns no store, holds no state. Phase 2, complete; the original in-memory buffer/flush-worker design was replaced by decision 11. |
 | Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | `RawLogPollingWorker` reads new `suggestx-raw-logs` objects on a timer via a sortable-key checkpoint, durably persisted in `suggestx-aggregator-checkpoints` (DynamoDB). `IPhraseFrequencyWriter` maps and reduces each batch's phrases into atomic `ADD`s against `suggestx-phrase-frequencies`, case-insensitive. Phase 3, complete (Modules 1–3). |
-| Trie builder | 5 | `src/services/SuggestX.TrieBuilder/` | `TrieBuildWorker` reads all of `suggestx-phrase-frequencies` on a timer and builds a fresh `CompressedTrie` (Phase 4 Module 1, verified against real branching data via `GET /_debug/search`). The Redis flattening and ZooKeeper-coordinated blue/green swap arrive Modules 2–3. |
+| Trie builder | 5 | `src/services/SuggestX.TrieBuilder/` | `TrieBuildWorker` reads all of `suggestx-phrase-frequencies` on a timer and builds a fresh `CompressedTrie` (Phase 4 Module 1, verified against real branching data via `GET /_debug/search`), then flattens it to `prefix → top-N` and publishes a new versioned namespace into Redis via `RedisFlattenedCachePublisher`, deleting the previous version's keys only after the new one is fully written (Phase 4 Module 2, verified across three real build cycles — see decision 14). The S3 snapshot and ZooKeeper-coordinated durable version pointer arrive Module 3. |
 | Web servers / entry point | 3 | `src/services/SuggestX.Gateway/` | YARP proxy, two routes (`/api/suggestions`, `/api/search-events`) live; no auth layer, since the source doc has no identity concept at all. |
 | HDFS | 4, 5 | `suggestx-raw-logs` (S3, LocalStack), written by the `suggestx-search-events` Firehose delivery stream, not directly by a service | `infra/localstack/init/01-bootstrap.sh`. See decision 3 (why S3) and decision 11 (why Firehose writes it instead of CollectionService). |
 | Cassandra | 4, 5 | `suggestx-phrase-frequencies` (DynamoDB, LocalStack) | Same script. See decision 3. |
@@ -407,11 +512,12 @@ build specifically (not left abstract).
 | Design-doc concept | Status |
 |---|---|
 | Compressed trie | ✅ Built and verified (Phase 4 Module 1) |
+| Flattened prefix → top-N cache (Redis) | ✅ Built and verified (Phase 4 Module 2) |
 | Trie partitioning by prefix range | ⬜ Designed, not built |
 | Offline trie updates (MapReduce-style) | ⬜ Designed, not built |
 | Collection service | ✅ Built and verified (Phase 2) |
 | Aggregator | ✅ Built and verified (Phase 3) |
-| Trie builder + ZooKeeper-coordinated swap | ⬜ Designed, not built |
+| Trie builder — S3 snapshot + ZooKeeper-coordinated version swap | ⬜ Designed, not built (Module 3) |
 | Suggestion service (Redis-backed) | ⬜ Designed, not built |
 | Client-side optimizations (debounce, input threshold, local cache, early connection, edge cache) | ⬜ Designed, not built |
 | Personalization | ⬜ Designed, not built |

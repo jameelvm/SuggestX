@@ -10,7 +10,7 @@ public sealed class AggregatorOptions
 {
     public const string SectionName = "Aggregator";
 
-    public int PollIntervalSeconds { get; set; } = 15;
+    public int PollIntervalSeconds { get; set; } = 30;
 
     /// <summary>
     /// Aggregator's exclusive DynamoDB table for its own read-progress

@@ -63,6 +63,63 @@ public sealed class CompressedTrie
             .ToList();
     }
 
+    /// <summary>
+    /// Walks the whole trie once and returns the top-N answer for every
+    /// distinct prefix reachable within <paramref name="maxPrefixLength"/>
+    /// characters — not every possible string, only ones that are actually
+    /// a real path in the trie (DESIGN.md decision 6's bound). This is the
+    /// one expensive traversal in the whole system, and it happens exactly
+    /// once per build cycle here, offline — never on a per-keystroke read
+    /// path (decision 2).
+    /// <para>
+    /// A compressed node's segment can span several characters, and a user
+    /// could stop typing at any point within it, not just at a node
+    /// boundary — every one of those stopping points shares the identical
+    /// answer (this node's whole subtree), since nothing branches until the
+    /// segment ends. So each node's top-N is computed exactly once and
+    /// reused for every prefix length that lands inside its own segment,
+    /// rather than being recomputed per character.
+    /// </para>
+    /// </summary>
+    public IReadOnlyDictionary<string, IReadOnlyList<(string Phrase, long Frequency)>> FlattenPrefixes(
+        int maxPrefixLength, int topN)
+    {
+        var result = new Dictionary<string, IReadOnlyList<(string, long)>>();
+        Flatten(_root, "", maxPrefixLength, topN, result);
+        return result;
+    }
+
+    private static void Flatten(
+        TrieNode node, string pathPrefix, int maxPrefixLength, int topN,
+        Dictionary<string, IReadOnlyList<(string, long)>> result)
+    {
+        foreach (var child in node.Children.Values)
+        {
+            var matches = new List<(string, long)>();
+            CollectTerminals(child, matches);
+            var ranked = matches
+                .OrderByDescending(m => m.Item2)
+                .ThenBy(m => m.Item1, StringComparer.Ordinal)
+                .Take(topN)
+                .ToList();
+
+            var segment = child.Segment;
+            for (var k = 1; k <= segment.Length; k++)
+            {
+                var prefixLength = pathPrefix.Length + k;
+                if (prefixLength > maxPrefixLength) break;
+
+                result[pathPrefix + segment[..k]] = ranked;
+            }
+
+            var childFullPath = pathPrefix + segment;
+            if (childFullPath.Length < maxPrefixLength)
+            {
+                Flatten(child, childFullPath, maxPrefixLength, topN, result);
+            }
+        }
+    }
+
     private void Insert(string phrase, long frequency)
     {
         // Uncompressed insert — one character per node. Compression runs as

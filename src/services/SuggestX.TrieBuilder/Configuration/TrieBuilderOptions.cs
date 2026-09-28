@@ -10,4 +10,16 @@ public sealed class TrieBuilderOptions
     public const string SectionName = "TrieBuilder";
 
     public int BuildIntervalSeconds { get; set; } = 20;
+
+    /// <summary>
+    /// DESIGN.md decision 6's bound: precompute top-N for every prefix up
+    /// to this many characters, not every possible prefix a user could
+    /// type. Beyond this bound, SuggestionService (Phase 5) is designed to
+    /// fall back to the last cached prefix and filter client-side — this
+    /// service only needs to know where to stop precomputing.
+    /// </summary>
+    public int MaxPrefixLength { get; set; } = 6;
+
+    /// <summary>The doc's own "top ten" default.</summary>
+    public int TopN { get; set; } = 10;
 }

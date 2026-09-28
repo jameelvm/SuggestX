@@ -13,6 +13,8 @@ public static class TrieBuilderServiceCollectionExtensions
 
         services.AddSingleton<ITrieHolder, TrieHolder>();
         services.AddSingleton<IPhraseFrequencyReader, DynamoPhraseFrequencyReader>();
+        services.AddSingleton<IFlattenedCachePublisher, RedisFlattenedCachePublisher>();
+        services.AddSingleton<ITrieBuildStats, TrieBuildStats>();
         services.AddHostedService<TrieBuildWorker>();
         return services;
     }
