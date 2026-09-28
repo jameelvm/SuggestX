@@ -5,8 +5,11 @@
 Say this to Claude at the start of the next session:
 
 > Read PROGRESS.md and CLAUDE.md in C:\System Design\TypeheadSuggestion\App,
-> then start Phase 6 — Gateway + frontend. Build it in short modules,
-> pausing after each one so I can review before you continue.
+> then continue Phase 6 — Gateway + frontend. Module 1 (the debounced
+> search box) is done and verified live in a browser; next is wiring
+> submitted searches to POST /api/search-events and an insights panel.
+> Build in short modules, pausing after each one so I can review before
+> you continue.
 
 **Build in short modules.** One concept per module, verified and explained
 before moving on — same discipline as JameX.
@@ -66,8 +69,15 @@ mode directly rather than trusting it — a long enough outage lets
 TrieBuilder's Redis cleanup roll past the version SuggestionService is
 still frozen on — accepted as a documented, bounded gap (decision 17)
 rather than closed. Real latency measured end to end: p95 well under
-10ms on every path tested, comfortably inside the doc's 200ms NFR.
-Phase 6 (Gateway + frontend) next.**
+10ms on every path tested, comfortably inside the doc's 200ms NFR.**
+**Phase 6 — Gateway + frontend. Module 1 (a real, hand-written Next.js
+app with a debounced search box) complete, verified live in a real
+Chrome browser** — confirmed via network inspection that debounce
+genuinely collapses many keystrokes into one request, the decision-6
+over-bound fallback renders correctly, and zero console errors after
+fixing the Gateway's CORS origins (still listed JameX's ports before
+this module actually needed them corrected). Submitting a search
+(`POST /api/search-events`) and an insights panel are next.**
 **Local debugging (cross-cutting, not a phase) — set up and verified.**
 Every service can now run under the Visual Studio debugger, on the exact
 port its container publishes, with the Gateway automatically reaching
@@ -681,29 +691,79 @@ correct, not an oversight.
 
 **Phase 5 is now complete.**
 
+- [x] **Phase 6 Module 1 — a real, hand-written Next.js app with a real
+      debounced search box wired to the live Gateway.** `web/` scaffolded
+      by hand (not `create-next-app`) mirroring JameX's own `web/`
+      conventions exactly: Next.js 16 App Router, React 19, Tailwind v4,
+      TypeScript strict, `src/{app,components,lib,hooks,types}`, and the
+      same server/browser Gateway-URL split (`GATEWAY_BASE_URL` vs.
+      `NEXT_PUBLIC_GATEWAY_BASE_URL`) and `requestJson`/`ApiError` fetch
+      core as JameX's `lib/api/errors.ts` — pointed at SuggestX's own
+      Gateway port (`9080`), not JameX's `8080`.
+
+      `useDebouncedValue` (`hooks/`) is the doc's own stated client-side
+      latency lever, finally built: 300ms after typing pauses, not a
+      request per keystroke. `SearchBox` (`components/search/`) is a
+      Client Component that debounces the query, calls
+      `fetchSuggestions` (`lib/api/suggestions.ts`, one `GET
+      /suggestions?prefix=` through the Gateway), and renders the
+      response — guarding against a slower earlier request's response
+      arriving after a faster later one via a monotonically increasing
+      request-id ref, a real race once debounce still lets two requests
+      overlap in flight, not a hypothetical one.
+
+      **A real, necessary infrastructure fix, not scope creep:**
+      `SuggestXHostingExtensions.cs`'s shared CORS policy still listed
+      JameX's ports (`3000`/`8080`) verbatim, copied early in the project
+      before any frontend existed to actually exercise it — updated to
+      SuggestX's real, documented port (`3010`), since without this fix
+      no browser request from the new frontend could reach the Gateway
+      at all.
+
+      **A real lint finding, not a style nit:** ESLint's
+      `react-hooks/set-state-in-effect` rule caught a synchronous
+      `setState` call in the empty-query early-return branch of the
+      fetch effect — fixed by deriving what's actually rendered
+      (`visibleSuggestions`/`visibleError`) from the trimmed query at
+      render time instead of clearing fetched state imperatively inside
+      the effect. `npm run build` (a real production build, not just
+      `next dev`) and `npx eslint .` both pass clean after the fix.
+
+      **Verified against the live stack, in a real Chrome browser, not
+      just `curl`:** typed `guitar` — all three phrases rendered
+      correctly, ranked and formatted identically to the earlier
+      `SuggestionService` verification. Typed `guitar lesso` (past the
+      6-character bound) immediately after — confirmed via
+      `read_network_requests` that six rapid keystrokes produced exactly
+      **one** network request (`GET
+      /api/suggestions?prefix=guitar%20lesso`, `200`), proving debounce
+      is real and not merely present in the code; the rendered result
+      correctly showed only `guitar lesson`, matching the over-bound
+      fallback verified earlier in Phase 5. `jazz` correctly rendered
+      both phrases ranked by frequency (piano 6, age 1). Clearing the
+      input correctly cleared the rendered results. Zero browser console
+      errors across the whole session — confirming the CORS fix actually
+      works, not just that it compiles.
+
 ### In progress
 
-Nothing — Phase 5 fully verified: read path, the ZooKeeper-outage gap
-decision, and real latency numbers.
+Nothing — Phase 6 Module 1 verified live in a real browser.
 
 ### Next up (immediate)
 
-**Phase 6 — Gateway + frontend**, not started:
+**Phase 6 — Gateway + frontend**, continued:
 
-1. Decide the frontend's shape: a real debounced search box (client-side
-   debounce is one of the doc's own stated latency levers, not yet built
-   anywhere in this system) calling `GET /api/suggestions?prefix=` through
-   the Gateway, plus — per the doc's `addToDatabase(query)` API — firing
-   `POST /api/search-events` once a search is actually submitted, closing
-   the loop back into the write pipeline this whole system already runs.
-2. An insights panel showing live system state: current trie version,
+2. Per the doc's `addToDatabase(query)` API: fire `POST
+   /api/search-events` once a search is actually submitted (not on every
+   debounced keystroke), closing the loop back into the write pipeline
+   this whole system already runs — verify a submitted search is
+   visible flowing through Collection → Aggregator → TrieBuilder → back
+   into SuggestionService within one full pipeline cycle, watched live
+   from the browser.
+3. An insights panel showing live system state: current trie version,
    flattened prefix count, aggregation lag — surfacing the various
    `/_debug/status` endpoints already built across every service rather
    than building new instrumentation from scratch.
-3. Verify: a real browser session, typing a prefix, sees debounced
-   requests and real suggestions; a submitted search is visible flowing
-   through Collection → Aggregator → TrieBuilder → back into
-   SuggestionService within one full pipeline cycle, watched live.
 
 ---
 
@@ -729,9 +789,11 @@ Ordered. Each phase leaves the build green **and** updates `README.md` and
    top-N response, verified live including the decision-6 over-bound
    fallback, real sub-10ms-p95 latency, and a real ZooKeeper-outage gap
    found live and accepted as documented (decision 17).
-6. **Gateway + frontend** — YARP routing, a real debounced search box, an
-   insights panel showing live trie version/partition state and aggregation
-   lag. Not started.
+6. **Gateway + frontend** — YARP routing (done, Phase 1) and a real,
+   hand-written Next.js debounced search box (done, Module 1, verified
+   live in a browser). Wiring submitted searches to `POST
+   /api/search-events` and an insights panel showing live trie
+   version/aggregation state remain.
 7. **Evaluation extras** — personalization (blend client-cached recent
    searches with global ranking), client-side optimizations (debounce, input
    threshold, early connection, edge-cache headers), fault-tolerance

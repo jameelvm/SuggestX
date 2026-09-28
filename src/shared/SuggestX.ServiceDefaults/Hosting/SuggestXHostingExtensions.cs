@@ -80,8 +80,12 @@ public static class SuggestXHostingExtensions
 
         // The Gateway proxies for the frontend, but hitting a service
         // directly from the Next.js origin during development is useful.
+        // 3010, not Next's default 3000 — CLAUDE.md's port table shifts
+        // every SuggestX port +1000 so this stack and JameX's can both run
+        // at once; 3000 is left in too since it costs nothing and covers
+        // running the frontend with its own default port during ad hoc work.
         builder.Services.AddCors(options => options.AddDefaultPolicy(policy => policy
-            .WithOrigins("http://localhost:3000", "http://localhost:8080")
+            .WithOrigins("http://localhost:3010", "http://localhost:3000")
             .AllowAnyHeader()
             .AllowAnyMethod()));
 

@@ -194,7 +194,8 @@ Ports are shifted +1000 from the "obvious" numbers, deliberately: this
 project's sibling, JameX, already runs a compose stack claiming 8080-8090,
 6379 and 4566 on the same machine, and both are meant to be runnable at once.
 
-Ports: web `3010` (planned, Phase 6), gateway `9080`, suggestion `9081`,
+Ports: web `3010` (`npm run dev` inside `web/`, host-run only so far — not
+yet containerised), gateway `9080`, suggestion `9081`,
 collection `9082`, aggregator `9083` (health/status only), trie-builder
 `9084` (health/status only), ZooKeeper `2181` (no conflict — JameX doesn't
 run one), Redis `6380`, LocalStack `4567` (container-internal port stays the

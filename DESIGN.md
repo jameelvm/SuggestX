@@ -461,6 +461,49 @@ considered, and why this one won.
     the failure-mode table's own prior claim rather than just confirming
     it — see the corrected row below.
 
+18. **The frontend (`web/`) is hand-written, not scaffolded by a CLI
+    (`create-next-app`), mirroring JameX's own `web/` structure and
+    conventions exactly rather than whatever a generator would produce.**
+    Next.js 16 App Router, React 19, Tailwind v4, TypeScript strict — the
+    same stack CLAUDE.md already named. The same server/browser
+    Gateway-URL split as JameX (`GATEWAY_BASE_URL` vs.
+    `NEXT_PUBLIC_GATEWAY_BASE_URL`) and the same `requestJson`/`ApiError`
+    fetch core, pointed at SuggestX's own Gateway port (`9080`) instead
+    of JameX's `8080` — the one thing that actually differs between the
+    two, since every other architectural choice already matched.
+
+    `useDebouncedValue` (300ms) is the doc's own stated client-side
+    latency lever, built for real for the first time in this project —
+    every prior phase exercised the backend directly. A monotonically
+    increasing request-id ref in `SearchBox` guards against a slower
+    earlier request's response arriving after a faster later one, a real
+    race once debounce still allows two requests to overlap in flight,
+    not a hypothetical one addressed defensively.
+
+    **Two real problems this module surfaced, not just its own new
+    code:** first, `SuggestXHostingExtensions.cs`'s shared CORS policy
+    had listed JameX's ports (`3000`/`8080`) verbatim since early in the
+    project, before any frontend existed to actually exercise it —
+    nothing caught the mismatch until a real browser tried to call the
+    Gateway from `localhost:3010` and would have been silently blocked.
+    Second, ESLint's `react-hooks/set-state-in-effect` rule caught a
+    synchronous `setState` call in `SearchBox`'s empty-query early-return
+    branch — fixed by deriving what's rendered from the trimmed query at
+    render time instead of imperatively clearing fetched state inside the
+    effect. Both are exactly the kind of thing "verify in a real browser,
+    not just that the code compiles" is meant to catch.
+
+    **Verified live, in a real Chrome browser, not `curl`:** `guitar`
+    rendered all three phrases correctly; typing `guitar lesso` (past the
+    6-character bound) confirmed via network inspection that six rapid
+    keystrokes produced exactly one request — debounce is real, not just
+    present in the code — and the rendered result correctly matched only
+    `guitar lesson`, the same over-bound fallback verified in decision 16.
+    `jazz` rendered both phrases correctly ranked by frequency. Clearing
+    the input cleared the results. Zero browser console errors across the
+    session. `npm run build` (a real production build) and `npx eslint .`
+    both pass clean.
+
 ## §2 Failure-mode table
 
 | Failure | Effect without mitigation | Mitigation in this build |
@@ -663,6 +706,7 @@ build specifically (not left abstract).
 | Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | `RawLogPollingWorker` reads new `suggestx-raw-logs` objects on a timer via a sortable-key checkpoint, durably persisted in `suggestx-aggregator-checkpoints` (DynamoDB). `IPhraseFrequencyWriter` maps and reduces each batch's phrases into atomic `ADD`s against `suggestx-phrase-frequencies`, case-insensitive. Phase 3, complete (Modules 1–3). |
 | Trie builder | 5 | `src/services/SuggestX.TrieBuilder/` | `TrieBuildWorker` reads all of `suggestx-phrase-frequencies` on a timer and builds a fresh `CompressedTrie` (Phase 4 Module 1, verified against real branching data via `GET /_debug/search`), flattens it to `prefix → top-N` and publishes a new versioned namespace into Redis via `RedisFlattenedCachePublisher` (Phase 4 Module 2, decision 14), then persists that same content to S3 (`S3TrieSnapshotStore`) and flips a ZooKeeper `current_version` znode (`ZooKeeperVersionPublisher`) — only after Redis already has it live — so a restart recovers the last published version instead of resetting to 1 (Phase 4 Module 3, decision 15, verified across a real container restart). Phase 4 is now complete. |
 | Web servers / entry point | 3 | `src/services/SuggestX.Gateway/` | YARP proxy, two routes (`/api/suggestions`, `/api/search-events`) live; no auth layer, since the source doc has no identity concept at all. |
+| Client (the doc's implicit browser/app calling the two APIs) | 2, 5 | `web/` | Hand-written Next.js 16 App Router app (not CLI-scaffolded — see decision 18), mirroring JameX's own `web/` conventions. `SearchBox` debounces input (`useDebouncedValue`, 300ms) and calls `GET /api/suggestions` through the Gateway. Phase 6 Module 1, verified live in a real browser. |
 | HDFS | 4, 5 | `suggestx-raw-logs` (S3, LocalStack), written by the `suggestx-search-events` Firehose delivery stream, not directly by a service | `infra/localstack/init/01-bootstrap.sh`. See decision 3 (why S3) and decision 11 (why Firehose writes it instead of CollectionService). |
 | Cassandra | 4, 5 | `suggestx-phrase-frequencies` (DynamoDB, LocalStack) | Same script. See decision 3. |
 | MongoDB (trie doc store) | 5 | `suggestx-trie-snapshots` (S3, LocalStack) | Same script. See decision 3 — S3, not a document store, deliberately. |
@@ -681,5 +725,6 @@ build specifically (not left abstract).
 | Aggregator | ✅ Built and verified (Phase 3) |
 | Trie builder — S3 snapshot + ZooKeeper-coordinated version swap | ✅ Built and verified (Phase 4 Module 3) |
 | Suggestion service (Redis-backed) | ✅ Built and verified (Phase 5 Module 1) |
-| Client-side optimizations (debounce, input threshold, local cache, early connection, edge cache) | ⬜ Designed, not built |
+| Client-side optimization — debounce | ✅ Built and verified (Phase 6 Module 1) |
+| Client-side optimizations — input threshold, local cache, early connection, edge cache | ⬜ Designed, not built |
 | Personalization | ⬜ Designed, not built |
