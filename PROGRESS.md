@@ -5,10 +5,11 @@
 Say this to Claude at the start of the next session:
 
 > Read PROGRESS.md and CLAUDE.md in C:\System Design\TypeheadSuggestion\App,
-> then continue Phase 6 — Gateway + frontend. Module 1 (the debounced
-> search box) is done and verified live in a browser; next is wiring
-> submitted searches to POST /api/search-events and an insights panel.
-> Build in short modules, pausing after each one so I can review before
+> then continue Phase 6 — Gateway + frontend. Modules 1-2 (debounced
+> search box, submitting a search into the write pipeline) are done and
+> verified live, including a full pipeline round trip watched from a
+> single browser action. Next is an insights panel. Build in short
+> modules, pausing after each one so I can review before
 > you continue.
 
 **Build in short modules.** One concept per module, verified and explained
@@ -70,14 +71,18 @@ TrieBuilder's Redis cleanup roll past the version SuggestionService is
 still frozen on — accepted as a documented, bounded gap (decision 17)
 rather than closed. Real latency measured end to end: p95 well under
 10ms on every path tested, comfortably inside the doc's 200ms NFR.**
-**Phase 6 — Gateway + frontend. Module 1 (a real, hand-written Next.js
-app with a debounced search box) complete, verified live in a real
-Chrome browser** — confirmed via network inspection that debounce
+**Phase 6 — Gateway + frontend. Modules 1-2 complete, verified live in a
+real Chrome browser.** Module 1: a real, hand-written Next.js app with a
+debounced search box — confirmed via network inspection that debounce
 genuinely collapses many keystrokes into one request, the decision-6
-over-bound fallback renders correctly, and zero console errors after
-fixing the Gateway's CORS origins (still listed JameX's ports before
-this module actually needed them corrected). Submitting a search
-(`POST /api/search-events`) and an insights panel are next.**
+over-bound fallback renders correctly, zero console errors after fixing
+the Gateway's CORS origins (still listed JameX's ports before this
+module actually needed them corrected). Module 2: submitting a search
+(Enter or picking a suggestion) now fires `POST /api/search-events`,
+closing the loop — watched a single browser action for a brand-new
+phrase flow through every stage of the real pipeline (S3 → DynamoDB →
+Redis) and reappear as a genuine suggestion in the same browser tab,
+with no restart anywhere. An insights panel is next.**
 **Local debugging (cross-cutting, not a phase) — set up and verified.**
 Every service can now run under the Visual Studio debugger, on the exact
 port its container publishes, with the Gateway automatically reaching
@@ -745,21 +750,60 @@ correct, not an oversight.
       errors across the whole session — confirming the CORS fix actually
       works, not just that it compiles.
 
+- [x] **Phase 6 Module 2 — submitting a search closes the loop into the
+      write pipeline.** The doc's `addToDatabase(query)` API, fired on
+      Enter or on picking a rendered suggestion — never on a debounced
+      keystroke, the same distinction CollectionService's own controller
+      comment already draws. `lib/api/search-events.ts`
+      (`submitSearchEvent`) is a thin `POST /search-events` call; `errors.ts`
+      gained `requestVoid` and `browser-client.ts` gained
+      `browserApiMutate`, both mirroring JameX's own void-response mutation
+      pattern exactly, since `POST /search-events` returns a bare `202`
+      with no body. `SearchBox` gained an `onKeyDown` handler (Enter) and
+      turned each suggestion row into a `<button>` (`onClick`), both
+      calling the same `submit(term)` — with a small, real UI
+      confirmation (`Logged "..."`) so a person watching the browser can
+      see the submission actually landed, not just infer it.
+
+      **A real environment problem found along the way, not a code bug:**
+      the first submission attempt returned `503` — `collection-service`
+      and `aggregator` had both stopped running at some point during this
+      long-running session (`docker compose ps` showed only 6 of 8
+      containers up). `docker compose up -d` brought the full stack back;
+      unrelated to this module's own code, but a real thing this
+      verification step caught that a narrower check would have missed.
+
+      **Verified against the live stack, watching the entire pipeline
+      fire from a single real browser action, not inferred from any one
+      service in isolation:** typed a genuinely new phrase never before
+      seen by the system (`banjo tutorial`) — correctly showed no
+      suggestions (a true negative, proving it wasn't already cached).
+      Pressed Enter — the UI confirmed `Logged "banjo tutorial"`.
+      Watched it live, in order, through every stage's own logs: landed
+      in `suggestx-raw-logs` (S3) as its own Firehose-delivered object
+      within seconds; `RawLogPollingWorker` read it and
+      `DynamoPhraseFrequencyWriter` applied it (`suggestx-phrase-frequencies`
+      now holding `banjo tutorial` at frequency 1, confirmed via
+      `awslocal dynamodb get-item`); the next `TrieBuildWorker` cycle
+      rebuilt with **10** phrases (up from 9) and published `trie:v143:banjo`
+      into Redis. Searched `banjo` again in the same browser tab, with no
+      restart or reload of anything — `banjo tutorial` now rendered as a
+      real suggestion. Also verified the click-to-submit path separately:
+      clicking a rendered suggestion filled the input with its phrase and
+      produced the identical `Logged "..."` confirmation. This is the
+      first time in the whole project a single user action was watched
+      flowing through every stage of the pipeline end to end.
+
 ### In progress
 
-Nothing — Phase 6 Module 1 verified live in a real browser.
+Nothing — Phase 6 Modules 1 and 2 verified live in a real browser,
+including one full round trip through the entire pipeline from a single
+user action.
 
 ### Next up (immediate)
 
 **Phase 6 — Gateway + frontend**, continued:
 
-2. Per the doc's `addToDatabase(query)` API: fire `POST
-   /api/search-events` once a search is actually submitted (not on every
-   debounced keystroke), closing the loop back into the write pipeline
-   this whole system already runs — verify a submitted search is
-   visible flowing through Collection → Aggregator → TrieBuilder → back
-   into SuggestionService within one full pipeline cycle, watched live
-   from the browser.
 3. An insights panel showing live system state: current trie version,
    flattened prefix count, aggregation lag — surfacing the various
    `/_debug/status` endpoints already built across every service rather
@@ -789,11 +833,12 @@ Ordered. Each phase leaves the build green **and** updates `README.md` and
    top-N response, verified live including the decision-6 over-bound
    fallback, real sub-10ms-p95 latency, and a real ZooKeeper-outage gap
    found live and accepted as documented (decision 17).
-6. **Gateway + frontend** — YARP routing (done, Phase 1) and a real,
-   hand-written Next.js debounced search box (done, Module 1, verified
-   live in a browser). Wiring submitted searches to `POST
-   /api/search-events` and an insights panel showing live trie
-   version/aggregation state remain.
+6. **Gateway + frontend** — YARP routing (done, Phase 1), a real,
+   hand-written Next.js debounced search box (done, Module 1), and
+   submitting a search into the write pipeline (done, Module 2) — all
+   verified live in a browser, including a full pipeline round trip from
+   a single browser action. An insights panel showing live trie
+   version/aggregation state remains.
 7. **Evaluation extras** — personalization (blend client-cached recent
    searches with global ranking), client-side optimizations (debounce, input
    threshold, early connection, edge-cache headers), fault-tolerance

@@ -34,3 +34,23 @@ export async function requestJson<T>(
 
   return (await response.json()) as T;
 }
+
+/**
+ * For mutations whose success response carries no body — `POST
+ * /search-events` returns a bare `202`, mirroring JameX's own
+ * `requestVoid`. Deliberately separate from {@link requestJson} rather
+ * than guessing based on status code: a caller expecting real JSON back
+ * should still get a clear parse failure if a body it needed turns out to
+ * be empty, not have that silently coerced away.
+ */
+export async function requestVoid(
+  baseUrl: string,
+  path: string,
+  init?: RequestInit,
+): Promise<void> {
+  const response = await fetch(`${baseUrl}${path}`, init);
+
+  if (!response.ok) {
+    throw new ApiError(response.status, path);
+  }
+}

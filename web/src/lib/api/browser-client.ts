@@ -1,5 +1,5 @@
 import { publicGatewayBaseUrl } from "@/lib/config";
-import { requestJson } from "@/lib/api/errors";
+import { requestJson, requestVoid } from "@/lib/api/errors";
 
 export { ApiError } from "@/lib/api/errors";
 
@@ -15,4 +15,9 @@ export function browserApiFetch<T>(
   init?: RequestInit,
 ): Promise<T> {
   return requestJson<T>(publicGatewayBaseUrl, path, init);
+}
+
+/** For mutations with no response body — see {@link requestVoid}. */
+export function browserApiMutate(path: string, init?: RequestInit): Promise<void> {
+  return requestVoid(publicGatewayBaseUrl, path, init);
 }

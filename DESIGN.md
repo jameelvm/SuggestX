@@ -504,6 +504,45 @@ considered, and why this one won.
     session. `npm run build` (a real production build) and `npx eslint .`
     both pass clean.
 
+19. **Submitting a search — Enter, or picking a rendered suggestion —
+    fires the doc's `addToDatabase(query)` API, never a debounced
+    keystroke.** `submitSearchEvent` (`lib/api/search-events.ts`) is a
+    thin `POST /search-events`; `requestVoid`/`browserApiMutate` were
+    added to the fetch core specifically because this endpoint returns a
+    bare `202` with no body, mirroring JameX's own void-mutation pattern
+    exactly rather than reusing `requestJson` and discarding whatever it
+    parsed. `SearchBox` turns each suggestion row into a real `<button>`
+    (`onClick`) rather than a `<li>`, since picking a suggestion is
+    itself a genuine search submission, not just a display choice — the
+    same signal Enter sends, through the same `submit(term)` function.
+
+    This is the first module in the whole project that exercises the
+    *entire* pipeline from a single external trigger, rather than one
+    service in isolation. A small, real UI confirmation (`Logged
+    "..."`) exists specifically so that trigger and its effect are both
+    visible to whoever is watching, not just inferable from a network
+    tab.
+
+    **Verified against the live stack, watching a single real browser
+    action propagate through every stage in order, not inferred from any
+    one service's logs alone:** submitted a phrase (`banjo tutorial`)
+    that had never existed in the system before — confirmed it showed no
+    suggestions beforehand (a true negative, ruling out it already being
+    cached). After submitting, watched, in sequence: a new Firehose-
+    delivered object land in `suggestx-raw-logs` within seconds;
+    `RawLogPollingWorker`/`DynamoPhraseFrequencyWriter` pick it up and
+    write it into `suggestx-phrase-frequencies` (confirmed via
+    `awslocal dynamodb get-item`); the next `TrieBuildWorker` cycle
+    rebuild with one more phrase than before and publish the
+    corresponding `trie:v{N}:banjo` key into Redis. Then, in the same
+    browser tab with nothing reloaded or restarted, searched the same
+    prefix again — the phrase now rendered as a real suggestion. A real
+    environment issue surfaced along the way (CollectionService and
+    Aggregator had both stopped running earlier in this long session,
+    producing an initial `503`) — unrelated to this module's own code,
+    fixed by `docker compose up -d`, and left in the verification record
+    rather than quietly retried away.
+
 ## §2 Failure-mode table
 
 | Failure | Effect without mitigation | Mitigation in this build |
@@ -706,7 +745,7 @@ build specifically (not left abstract).
 | Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | `RawLogPollingWorker` reads new `suggestx-raw-logs` objects on a timer via a sortable-key checkpoint, durably persisted in `suggestx-aggregator-checkpoints` (DynamoDB). `IPhraseFrequencyWriter` maps and reduces each batch's phrases into atomic `ADD`s against `suggestx-phrase-frequencies`, case-insensitive. Phase 3, complete (Modules 1–3). |
 | Trie builder | 5 | `src/services/SuggestX.TrieBuilder/` | `TrieBuildWorker` reads all of `suggestx-phrase-frequencies` on a timer and builds a fresh `CompressedTrie` (Phase 4 Module 1, verified against real branching data via `GET /_debug/search`), flattens it to `prefix → top-N` and publishes a new versioned namespace into Redis via `RedisFlattenedCachePublisher` (Phase 4 Module 2, decision 14), then persists that same content to S3 (`S3TrieSnapshotStore`) and flips a ZooKeeper `current_version` znode (`ZooKeeperVersionPublisher`) — only after Redis already has it live — so a restart recovers the last published version instead of resetting to 1 (Phase 4 Module 3, decision 15, verified across a real container restart). Phase 4 is now complete. |
 | Web servers / entry point | 3 | `src/services/SuggestX.Gateway/` | YARP proxy, two routes (`/api/suggestions`, `/api/search-events`) live; no auth layer, since the source doc has no identity concept at all. |
-| Client (the doc's implicit browser/app calling the two APIs) | 2, 5 | `web/` | Hand-written Next.js 16 App Router app (not CLI-scaffolded — see decision 18), mirroring JameX's own `web/` conventions. `SearchBox` debounces input (`useDebouncedValue`, 300ms) and calls `GET /api/suggestions` through the Gateway. Phase 6 Module 1, verified live in a real browser. |
+| Client (the doc's implicit browser/app calling both APIs) | 2, 5 | `web/` | Hand-written Next.js 16 App Router app (not CLI-scaffolded — see decision 18), mirroring JameX's own `web/` conventions. `SearchBox` debounces input (`useDebouncedValue`, 300ms) and calls `GET /api/suggestions` through the Gateway (Phase 6 Module 1); submitting a search (Enter or picking a suggestion) calls `POST /api/search-events` (Module 2, decision 19), the first time in the project a single browser action was watched flowing through the entire pipeline and back. Both verified live in a real browser. |
 | HDFS | 4, 5 | `suggestx-raw-logs` (S3, LocalStack), written by the `suggestx-search-events` Firehose delivery stream, not directly by a service | `infra/localstack/init/01-bootstrap.sh`. See decision 3 (why S3) and decision 11 (why Firehose writes it instead of CollectionService). |
 | Cassandra | 4, 5 | `suggestx-phrase-frequencies` (DynamoDB, LocalStack) | Same script. See decision 3. |
 | MongoDB (trie doc store) | 5 | `suggestx-trie-snapshots` (S3, LocalStack) | Same script. See decision 3 — S3, not a document store, deliberately. |
