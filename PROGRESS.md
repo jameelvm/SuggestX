@@ -853,6 +853,21 @@ correct, not an oversight.
       (long terminal labels clipping against the SVG edge). Zero console
       errors. `npm run build` and `npx eslint .` both pass clean.
 
+      **Follow-up (2026-09-28), after real use surfaced two more real
+      problems:** the page was capped at `max-w-5xl`, wasting most of a
+      normal monitor — widened to fill the available width. More
+      significantly, the graph's `viewBox`-scaled SVG shrank every label
+      to fit its container, which was the actual readability complaint,
+      not font size on its own — fixed by rendering at a real fixed
+      pixel size in a horizontally scrolling strip instead. That
+      surfaced a second bug the shrinking had been hiding: uniform,
+      fixed-width leaf slots let two adjacent long phrases
+      ("mykonos perfume"/"mykonos summer perfume") render with
+      overlapping labels once no longer scaled down — fixed by sizing
+      each leaf's slot from its own estimated label width instead of one
+      spacing constant for every leaf. Verified live again: the same
+      pair now renders cleanly, and the page visibly fills the window.
+
 **Phase 6 is now complete — all three modules.**
 
 ### In progress

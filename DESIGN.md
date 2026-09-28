@@ -592,6 +592,30 @@ considered, and why this one won.
     clipping against the SVG viewBox's edge, fixed by padding the
     viewBox for label width, not just node position.
 
+    **Follow-up, after real use surfaced two more problems the first
+    pass missed:** the page itself was capped at `max-w-5xl` (64rem),
+    leaving most of a normal monitor blank — widened to fill the
+    available width (`w-full` with responsive padding, no cap) instead.
+    More significantly, the graph's original `viewBox` + `w-full`
+    approach scaled the *entire* SVG, text included, down to fit
+    whatever width its container happened to have — on anything less
+    than a very wide screen this made every label smaller than intended,
+    which was the actual readability complaint, not a font-size choice
+    on its own. Fixed by rendering the SVG at a real, fixed pixel size
+    (never scaled) inside a horizontally scrolling strip. That alone
+    surfaced a second, previously-invisible bug: leaf slots were a
+    uniform fixed width, so two adjacent long phrases — "mykonos
+    perfume" and "mykonos summer perfume," genuinely adjacent siblings
+    in this session's own test data — rendered with overlapping labels
+    once no longer shrunk to fit. Fixed by sizing each leaf's slot from
+    its own label's estimated width (character count × an average glyph
+    width, not a real text measurement — unavailable during a server
+    render) plus a fixed gap, rather than a single spacing constant for
+    every leaf regardless of its phrase length. Verified live again
+    after both fixes: the same "mykonos perfume"/"mykonos summer
+    perfume" pair renders with clean, non-overlapping labels; the page
+    visibly uses the full window width.
+
 ## §2 Failure-mode table
 
 | Failure | Effect without mitigation | Mitigation in this build |

@@ -9,19 +9,41 @@ interface LayoutNode {
   children: LayoutNode[];
 }
 
-const X_SPACING = 130;
-const Y_SPACING = 70;
+const Y_SPACING = 100;
+const LABEL_FONT_SIZE = 14;
+const NODE_RADIUS = { internal: 6, terminal: 9 };
+const MIN_LEAF_GAP = 28;
+const MIN_LEAF_ADVANCE = 90;
+const SIDE_PADDING = 20;
+
+// A rough average glyph width at LABEL_FONT_SIZE, not an exact text
+// measurement (that needs a real DOM/canvas call this layout — run
+// during render, before anything is on screen to measure — can't make).
+// Good enough to keep two adjacent long phrases from visually
+// overlapping, which a fixed per-leaf spacing could never guarantee once
+// phrase lengths vary as much as this project's own test data does
+// ("solo" vs. "mykonos summer perfume").
+const CHAR_WIDTH = 7.6;
+
+function estimateLabelWidth(node: TrieTreeNode): number {
+  if (!node.isTerminal) return 0;
+  return `${node.phrase} (${node.frequency})`.length * CHAR_WIDTH;
+}
 
 /**
- * Standard small-tree layout: a leaf gets the next free horizontal slot,
- * an internal node sits at the midpoint of its children — computed once
- * per render, cheap at this project's demo scale (a few dozen nodes at
- * most, the same scale `CompressedTrie.ToSnapshot` itself only expects).
+ * Standard small-tree layout, with one deliberate departure from the
+ * textbook version: a leaf's horizontal slot is sized by its own label
+ * width (plus a fixed gap), not a uniform spacing constant — so "solo"
+ * and "mykonos summer perfume" each get exactly the room their own
+ * rendered text needs, not the same fixed box. An internal node still
+ * sits at the midpoint of its children, computed once per render, cheap
+ * at this project's demo scale.
  */
 function layout(node: TrieTreeNode, depth: number, cursor: { x: number }): LayoutNode {
   if (node.children.length === 0) {
-    const x = cursor.x * X_SPACING;
-    cursor.x += 1;
+    const halfWidth = Math.max(estimateLabelWidth(node) / 2, MIN_LEAF_ADVANCE / 2);
+    const x = cursor.x + halfWidth;
+    cursor.x = x + halfWidth + MIN_LEAF_GAP;
     return { node, x, y: depth * Y_SPACING, children: [] };
   }
 
@@ -48,15 +70,15 @@ function renderEdges(laidOut: LayoutNode): ReactNode[] {
       x2={child.x}
       y2={child.y}
       stroke="#d4d4d4"
-      strokeWidth={1.5}
+      strokeWidth={2}
     />,
     <text
       key={`label-${child.x}-${child.y}`}
       x={(laidOut.x + child.x) / 2}
-      y={(laidOut.y + child.y) / 2 - 4}
-      fontSize={11}
+      y={(laidOut.y + child.y) / 2 - 8}
+      fontSize={LABEL_FONT_SIZE}
       textAnchor="middle"
-      fill="#737373"
+      fill="#525252"
     >
       {child.node.segment}
     </text>,
@@ -68,9 +90,14 @@ function renderNodes(laidOut: LayoutNode): ReactNode[] {
   const { node, x, y } = laidOut;
   return [
     <g key={`node-${x}-${y}`}>
-      <circle cx={x} cy={y} r={node.isTerminal ? 7 : 5} fill={node.isTerminal ? "#059669" : "#a3a3a3"} />
+      <circle
+        cx={x}
+        cy={y}
+        r={node.isTerminal ? NODE_RADIUS.terminal : NODE_RADIUS.internal}
+        fill={node.isTerminal ? "#059669" : "#a3a3a3"}
+      />
       {node.isTerminal && (
-        <text x={x} y={y + 20} fontSize={11} textAnchor="middle" fill="#171717">
+        <text x={x} y={y + 26} fontSize={LABEL_FONT_SIZE} fontWeight={500} textAnchor="middle" fill="#171717">
           {node.phrase} ({node.frequency})
         </text>
       )}
@@ -86,29 +113,33 @@ function renderNodes(laidOut: LayoutNode): ReactNode[] {
  * a few dozen nodes at demo scale, and pulling in a real dependency for
  * that would be exactly the unnecessary abstraction this project's own
  * conventions warn against.
+ * <para>
+ * Rendered at its natural, fixed pixel size — never scaled down to fit a
+ * narrow container — wrapped in a horizontally scrolling strip instead.
+ * An earlier version used a `viewBox` + `w-full` SVG, which shrank every
+ * label proportionally on anything less than a very wide screen; that,
+ * combined with fixed-width leaf slots too narrow for this project's own
+ * longer phrases, is what made it hard to read — not a font-size choice
+ * on its own.
+ * </para>
  */
 export function TrieGraph({ root }: { root: TrieTreeNode }) {
-  const laidOut = layout(root, 0, { x: 0 });
+  const laidOut = layout(root, 0, { x: SIDE_PADDING });
   const bounds = { maxX: 0, maxY: 0 };
   collectBounds(laidOut, bounds);
 
-  // Terminal labels are centered text that can extend well past their
-  // node's own x position (a long phrase like "python programming (1)"
-  // is wider than the X_SPACING between nodes) — padding wide enough for
-  // that, not just for the node positions themselves, is what keeps the
-  // leftmost/rightmost labels from clipping against the viewBox edge.
-  const labelPadding = 90;
-  const width = bounds.maxX + X_SPACING;
-  const height = bounds.maxY + Y_SPACING;
+  const topPadding = 30;
+  const width = bounds.maxX + MIN_LEAF_ADVANCE / 2 + SIDE_PADDING;
+  const height = bounds.maxY + 80;
 
   return (
-    <svg
-      viewBox={`${-labelPadding} -20 ${width + labelPadding * 2} ${height + 40}`}
-      className="w-full"
-      style={{ maxHeight: 420 }}
-    >
-      {renderEdges(laidOut)}
-      {renderNodes(laidOut)}
-    </svg>
+    <div className="overflow-x-auto">
+      <svg width={width} height={height + topPadding} className="block">
+        <g transform={`translate(0, ${topPadding})`}>
+          {renderEdges(laidOut)}
+          {renderNodes(laidOut)}
+        </g>
+      </svg>
+    </div>
   );
 }
