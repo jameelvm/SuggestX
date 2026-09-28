@@ -14,7 +14,15 @@ public interface ITrieBuildStats
     int FlattenedPrefixCount { get; }
     DateTimeOffset? LastBuildAt { get; }
 
+    /// <summary>True once this process instance has recovered a version from
+    /// ZooKeeper on startup, rather than starting fresh at version 0 —
+    /// Module 3's own proof-of-work, the same role every other debug
+    /// endpoint in this project plays.</summary>
+    bool RecoveredOnStartup { get; }
+    int? RecoveredVersion { get; }
+
     void RecordBuild(int version, int flattenedPrefixCount);
+    void RecordRecovery(int recoveredVersion);
 }
 
 public sealed class TrieBuildStats : ITrieBuildStats
@@ -22,11 +30,19 @@ public sealed class TrieBuildStats : ITrieBuildStats
     public int CurrentVersion { get; private set; }
     public int FlattenedPrefixCount { get; private set; }
     public DateTimeOffset? LastBuildAt { get; private set; }
+    public bool RecoveredOnStartup { get; private set; }
+    public int? RecoveredVersion { get; private set; }
 
     public void RecordBuild(int version, int flattenedPrefixCount)
     {
         CurrentVersion = version;
         FlattenedPrefixCount = flattenedPrefixCount;
         LastBuildAt = DateTimeOffset.UtcNow;
+    }
+
+    public void RecordRecovery(int recoveredVersion)
+    {
+        RecoveredOnStartup = true;
+        RecoveredVersion = recoveredVersion;
     }
 }

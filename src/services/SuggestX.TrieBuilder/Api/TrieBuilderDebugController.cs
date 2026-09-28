@@ -26,7 +26,9 @@ public sealed class TrieBuilderDebugController(ITrieHolder trieHolder, ITrieBuil
             nodeCount = trie?.NodeCount ?? 0,
             currentVersion = stats.CurrentVersion,
             flattenedPrefixCount = stats.FlattenedPrefixCount,
-            lastBuildAt = stats.LastBuildAt
+            lastBuildAt = stats.LastBuildAt,
+            recoveredOnStartup = stats.RecoveredOnStartup,
+            recoveredVersion = stats.RecoveredVersion
         });
     }
 

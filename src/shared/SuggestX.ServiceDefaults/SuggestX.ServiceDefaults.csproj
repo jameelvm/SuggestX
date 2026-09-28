@@ -25,6 +25,11 @@
     <PackageReference Include="Microsoft.OpenApi" Version="2.11.0" />
     <PackageReference Include="Scalar.AspNetCore" Version="2.16.18" />
     <PackageReference Include="StackExchange.Redis" Version="3.1.13" />
+    <!-- The only actively maintained .NET async ZooKeeper client; mirrors the
+         official Java client's API near-verbatim (org.apache.zookeeper.*
+         namespace and all), which is why the usages below look unusually
+         Java-flavored for a C# codebase. -->
+    <PackageReference Include="ZooKeeperNetEx" Version="3.4.12.4" />
   </ItemGroup>
 
 </Project>

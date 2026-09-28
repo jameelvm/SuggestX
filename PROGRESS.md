@@ -5,8 +5,8 @@
 Say this to Claude at the start of the next session:
 
 > Read PROGRESS.md and CLAUDE.md in C:\System Design\TypeheadSuggestion\App,
-> then continue Phase 4 — Trie Builder, Module 3 (S3 snapshot persistence +
-> ZooKeeper-coordinated blue/green version swap). Build it in short modules,
+> then start Phase 5 — Suggestion Service (the real read path: ZooKeeper
+> current-version lookup, then one Redis `GET`). Build it in short modules,
 > pausing after each one so I can review before you continue.
 
 **Build in short modules.** One concept per module, verified and explained
@@ -34,7 +34,7 @@ state* and *Next up* sections at the end of every session.
 
 ## Current state
 
-**Last updated:** 2026-09-26
+**Last updated:** 2026-09-27
 **Phase 1 — local substrate. Complete, verified.**
 **Phase 2 — Collection Service. Complete, verified — and since rebuilt on
 Kinesis Data Firehose** in place of the original in-memory buffer/flush
@@ -47,14 +47,18 @@ new raw logs on a timer, the actual map-reduce into
 `suggestx-phrase-frequencies` (case-insensitive, atomic `ADD`, one write per
 unique phrase per batch), and durable checkpoint persistence in DynamoDB —
 proven across a genuine container restart, not just a fresh start.
-**Phase 4 — Trie Builder. Module 1 (the compressed trie itself, built from
-real DynamoDB data) complete, verified against real branching data — a
-shared-prefix split ("java" vs "jazz"), frequency ranking, alphabetical
-tie-breaking, case normalization, and a true negative all confirmed live.
-Module 2 (flatten `prefix → top-N` into a versioned Redis namespace) also
-complete, verified live across three real build cycles including the
-blue/green old-version cleanup. Module 3 (S3 snapshot + ZooKeeper-coordinated
-version swap) next.**
+**Phase 4 — Trie Builder. Complete, verified — all three modules.** Module 1
+(the compressed trie itself, built from real DynamoDB data) verified against
+real branching data — a shared-prefix split ("java" vs "jazz"), frequency
+ranking, alphabetical tie-breaking, case normalization, and a true negative
+all confirmed live. Module 2 (flatten `prefix → top-N` into a versioned
+Redis namespace) verified live across real build cycles including the
+blue/green old-version cleanup. Module 3 (S3 snapshot persistence + a real
+ZooKeeper `current_version` znode) verified live across a genuine container
+restart: the restarted process recovered version 3 from ZooKeeper (not a
+reset to 1), published version 4 next, and correctly cleaned up exactly
+version 3's Redis keys — proven directly against Redis, S3, and ZooKeeper,
+not inferred from logs alone. Phase 5 (Suggestion Service) next.**
 **Local debugging (cross-cutting, not a phase) — set up and verified.**
 Every service can now run under the Visual Studio debugger, on the exact
 port its container publishes, with the Gateway automatically reaching
@@ -511,24 +515,88 @@ correct, not an oversight.
       `GET /_debug/status` reported `currentVersion: 3`,
       `flattenedPrefixCount: 23`, matching the logs and Redis exactly.
 
+- [x] **Phase 4 Module 3 — S3 snapshot persistence + a real ZooKeeper
+      `current_version` znode, closing Module 2's accepted gap.** Added the
+      `ZooKeeperNetEx` client (the standard .NET async ZooKeeper client —
+      its API mirrors the Java client almost verbatim, `org.apache.zookeeper.*`
+      namespace included) to `SuggestX.ServiceDefaults`, registered as a
+      shared singleton the same way Redis/AWS clients are, since both
+      TrieBuilder (writer) and the future SuggestionService (reader) need it
+      — DESIGN.md decision 4.
+
+      `S3TrieSnapshotStore` (`Services/ITrieSnapshotStore.cs`) writes each
+      cycle's full flattened `prefix → top-N` result as one JSON object,
+      `v{N}.json`, to `suggestx-trie-snapshots` — the same content just
+      published to Redis, not a separate serialization of the raw trie,
+      since that's genuinely enough to recover both the "what was
+      published" state and (per the bucket's own doc comment) let a
+      restarted TrieBuilder skip an expensive re-scan-and-rebuild if it
+      ever needed to serve from the snapshot directly.
+
+      `ZooKeeperVersionPublisher` (`Services/IZooKeeperVersionPublisher.cs`)
+      owns the one znode this system writes today,
+      `/suggestx/trie/current_version` — created as a plain UTF-8 integer
+      string, ancestor znodes (`/suggestx`, `/suggestx/trie`) created
+      idempotently first since ZooKeeper has no recursive create.
+      `TrieBuildWorker` now, on startup, reads that znode once
+      (`RecoverAsync`): if a version exists, it resumes `_version` from
+      there and loads that version's S3 snapshot to seed
+      `_previousPrefixes`, instead of starting fresh at 0/empty. After every
+      successful Redis publish, it saves the S3 snapshot and flips the
+      znode — **only after** Redis already has the new version live, the
+      same blue/green ordering as Module 2's own Redis-key ordering, one
+      level up (decision 8, decision 14). A failure saving to S3/ZooKeeper
+      is logged and does not roll back the Redis publish, which already
+      succeeded — only this cycle's *recovery* state is stale until the
+      next successful one, an accepted small gap in the same spirit as
+      decision 13's checkpoint race, not a correctness problem for what's
+      actually being served.
+
+      **Verified against the live stack, with a genuine container
+      restart, not a simulated one:** confirmed the S3 object for each
+      version (`awslocal s3 ls`/`cp`) matched Redis's published content
+      exactly; confirmed the znode's value via `zkCli.sh get` tracked the
+      current version after every cycle. Then restarted the running
+      `trie-builder` container mid-sequence (`docker compose restart`)
+      while ZooKeeper held version 3: the log showed `Recovered version 3
+      from ZooKeeper with 28 known prefixes to clean up on next publish`
+      immediately on startup, followed by the next cycle publishing
+      version 4 — not resetting to 1 — and `Published trie version 4: 28
+      prefixes written, 28 old keys removed`, confirmed directly against
+      Redis that only `trie:v4:*` existed afterward, no leftover `v3`
+      keys. `GET /_debug/status` reported `recoveredOnStartup: true,
+      recoveredVersion: 3` alongside `currentVersion: 4`, matching the
+      logs and Redis exactly. Also found and cleaned up real forensic
+      evidence of the exact gap this module closes: a stray
+      `trie:v653:*` key set from an ungraceful restart during earlier
+      Module 1/2 development (before ZooKeeper tracking existed), never
+      cleaned up because nothing durable remembered it needed to be —
+      exactly the failure mode Module 3 now prevents going forward.
+
 ### In progress
 
-Nothing — Module 2 verified. Awaiting go-ahead for Module 3 (S3 snapshot
-persistence + ZooKeeper-coordinated blue/green version swap).
+Nothing — Phase 4 complete and verified end to end, all three modules.
 
 ### Next up (immediate)
 
-**Phase 4 — Trie data structure + Trie Builder**, continued:
+**Phase 5 — Suggestion Service**, not started:
 
-3. Persist a full trie snapshot to `suggestx-trie-snapshots` (S3) for
-   recovery, then flip the ZooKeeper `current_version` znode for each
-   partition only after the new version is fully written and validated —
-   the blue/green swap from decision 8, made durable and coordinated
-   instead of an in-process/in-memory version counter.
-4. Verify: a TrieBuilder restart recovers the last published version from
-   S3/ZooKeeper rather than resetting to version 1; confirm the
-   ZooKeeper znode only flips after the new Redis version is fully
-   written, never before.
+1. Read path: on startup and periodically, read
+   `/suggestx/trie/current_version` from ZooKeeper to know which
+   `trie:v{N}:*` Redis namespace is live; `GET /api/suggestions?prefix=`
+   does one Redis `GET` against that namespace and returns the top-N —
+   no trie traversal, no DynamoDB/S3 access, matching decision 2's whole
+   point.
+2. Decide and document how the service reacts to a version change
+   mid-flight (poll ZooKeeper on an interval vs. a watch-triggered
+   callback) and what it serves if Redis or ZooKeeper is briefly
+   unreachable (decision: cache the last-known version/serve stale rather
+   than fail the request — see the failure-mode table's existing "Redis
+   partition unreachable" row).
+3. Verify: real requests through `GET /api/suggestions` for prefixes
+   TrieBuilder has already published return correct top-N results with
+   real latency measured, not just correctness; confirm a new TrieBuilder
+   version becomes visible to SuggestionService without a restart.
 
 ---
 
@@ -545,11 +613,11 @@ Ordered. Each phase leaves the build green **and** updates `README.md` and
 3. ~~Aggregator~~ — done. S3 raw logs → DynamoDB frequency table, durably
    checkpointed batch worker, all verified live including across a real
    container restart.
-4. **Trie data structure + Trie Builder** — compressed trie in memory (done,
-   Module 1) and top-N flattening into a versioned Redis namespace (done,
-   Module 2), both verified against real branching data and real build
-   cycles. S3 snapshot for recovery + ZooKeeper blue/green version swap
-   (Module 3, not started).
+4. ~~Trie data structure + Trie Builder~~ — done. Compressed trie in memory
+   (Module 1), top-N flattening into a versioned Redis namespace (Module 2),
+   and S3 snapshot persistence + a real ZooKeeper `current_version` znode
+   (Module 3), all verified against real branching data, real build
+   cycles, and a genuine container restart.
 5. **Suggestion Service** — read path: ZooKeeper partition/version lookup →
    Redis `GET` → top-N response. Not started.
 6. **Gateway + frontend** — YARP routing, a real debounced search box, an

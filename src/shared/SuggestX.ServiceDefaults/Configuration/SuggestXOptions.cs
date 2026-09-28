@@ -89,4 +89,13 @@ public sealed class ZooKeeperOptions
 
     public string ConnectionString { get; set; } = "zookeeper:2181";
     public string RootPath { get; set; } = "/suggestx";
+
+    /// <summary>
+    /// How long the ensemble waits before declaring this client's session
+    /// dead after it stops hearing from it — a real ZooKeeper concept, not
+    /// an HTTP-style request timeout. 10s is a reasonable local default,
+    /// comfortably above this project's 20s build interval's own network
+    /// hiccups without masking a genuinely dead connection for too long.
+    /// </summary>
+    public int SessionTimeoutMs { get; set; } = 10_000;
 }

@@ -297,27 +297,70 @@ considered, and why this one won.
     the prior version's keys, so `redis-cli KEYS 'trie:*'` never showed a
     mix of two versions or a gap with none at all.
 
-    **What this deliberately does not close yet:** the version counter and
-    the "which prefixes did the last cycle publish" set are both plain
-    in-memory fields on `TrieBuildWorker` — nothing durable or shared
-    tracks "which version is current." A TrieBuilder restart today resets
-    the counter to 1 and starts overwriting `trie:v1:*` again. This is
-    harmless right now for the same reason decision 12's checkpoint gap
-    was harmless in Module 1 before it was closed: nothing outside this
-    process reads a "current version" pointer yet, since SuggestionService
-    doesn't exist until Phase 5. Module 3 is exactly the fix — persisting
-    a trie snapshot to S3 and moving "which version is current" into a
-    ZooKeeper znode that only flips after the new version is fully
-    written and validated, mirroring how decision 12 replaced Aggregator's
-    own in-memory-only checkpoint with a durable one before anything
-    downstream needed to trust it.
+    **What this deliberately did not close yet, when Module 2 shipped:**
+    the version counter and the "which prefixes did the last cycle
+    publish" set were both plain in-memory fields on `TrieBuildWorker` —
+    nothing durable or shared tracked "which version is current." A
+    TrieBuilder restart would reset the counter to 1 and start
+    overwriting `trie:v1:*` again. Closed by Module 3 below.
+
+15. **Module 3 closes decision 14's gap: a full snapshot of each version's
+    flattened cache is persisted to S3, and a real ZooKeeper znode
+    (`/suggestx/trie/current_version`) tracks which version is current —
+    both written only after that version's Redis keys are already fully
+    live.** `S3TrieSnapshotStore` writes `v{N}.json` to
+    `suggestx-trie-snapshots`, holding the identical `prefix → top-N`
+    content just published to Redis — not a separate serialization of the
+    raw trie, since the point (per `StorageOptions.TrieSnapshotsBucket`'s
+    own doc comment) is letting a restarted process skip re-deriving that
+    content from every historical DynamoDB frequency, not preserving the
+    trie's internal node structure, which nothing downstream ever needs
+    directly. `ZooKeeperVersionPublisher` owns the one znode this system
+    writes today; `TrieBuildWorker` reads it once at startup
+    (`RecoverAsync`) to resume its version counter and reload the
+    previous version's known prefixes from its S3 snapshot, instead of
+    resetting to 0/empty on every restart.
+
+    Ordering is decision 8's blue/green principle applied one layer
+    further out than decision 14's own Redis-key ordering: Redis publish
+    succeeds first (the thing that actually serves the data), *then* the
+    S3 snapshot is written, *then* the ZooKeeper znode flips — a version
+    is never claimed as "current and recoverable" before it's actually
+    both. A failure saving to S3/ZooKeeper is logged, not fatal: Redis
+    already has the correct, live version regardless, so only this
+    cycle's *recovery* state goes stale until the next cycle succeeds —
+    the same "small bounded gap over defensive machinery" tradeoff as
+    decision 13's checkpoint race, not a read-path correctness problem.
+
+    The .NET client is `ZooKeeperNetEx` — the standard async .NET port,
+    whose API mirrors the official Java client near-verbatim
+    (`org.apache.zookeeper.*` namespace included), registered as a shared
+    singleton in `SuggestX.ServiceDefaults` alongside Redis/AWS clients,
+    since both TrieBuilder (the sole writer) and the future
+    SuggestionService (a reader) need the same connection.
+
+    **Verified against the live stack, across a genuine container
+    restart, not a simulated one:** confirmed each version's S3 object
+    matched Redis's published content exactly, and the znode's value
+    tracked the current version after every cycle via `zkCli.sh get`.
+    Restarted the running `trie-builder` container mid-sequence while
+    ZooKeeper held version 3: it recovered version 3 on startup (logged
+    explicitly), published version 4 next — not resetting to 1 — and
+    correctly deleted exactly version 3's 28 Redis keys, leaving only
+    `trie:v4:*`. Also found, as direct forensic evidence that decision
+    14's gap was real and not merely theoretical, a stray `trie:v653:*`
+    key set orphaned by an ungraceful restart during earlier Module 1/2
+    development (before this znode existed) — never cleaned up because
+    nothing durable remembered it needed to be. Removed manually as
+    disposable local dev cache; the failure mode itself is what Module 3
+    now prevents going forward.
 
 ## §2 Failure-mode table
 
 | Failure | Effect without mitigation | Mitigation in this build |
 |---|---|---|
 | `TrieBuilder` crashes mid-build | Partial/corrupt version could be served | Blue/green swap (decision 8): the ZooKeeper pointer only flips after the full new version is written and validated, so a crash mid-build leaves the previously-served version untouched. |
-| `TrieBuilder` restarts | Its in-memory version counter and previous-prefix-set both reset, so it starts overwriting `trie:v1:*` again | Not mitigated yet — harmless today only because nothing outside the process reads a "current version" pointer before SuggestionService exists (Phase 5). Module 3 replaces this with S3 snapshot recovery + a durable ZooKeeper version pointer. See decision 14. |
+| `TrieBuilder` restarts | Its version counter and previous-prefix-set could reset, overwriting `trie:v1:*` again and orphaning the prior version's keys forever | Mitigated (Module 3, decision 15): startup reads the ZooKeeper `current_version` znode and reloads that version's S3 snapshot, resuming the counter and previous-prefix-set instead of resetting them. Verified live across a real container restart. |
 | Aggregator falls behind (batch job takes longer than its own interval) | Frequencies grow stale, or two runs overlap and double-count | Aggregator checkpoints its S3 read offset per run; a run that overlaps the next start is a documented open question (see §4) rather than silently assumed away. |
 | Aggregator crashes between a successful frequency `ADD` and its checkpoint's durable write | A restart re-reads and re-counts that one batch, over-counting it | Not mitigated — accepted as a rare, self-bounded (at most one batch) overcount rather than adding an idempotency guard or a cross-table transaction. See decision 13. |
 | ZooKeeper unreachable | `SuggestionService` cannot learn the current version | Suggestion Service caches the last-known version/partition map in memory and continues serving it; a ZooKeeper outage degrades to "suggestions may go stale," not "suggestions stop." |
@@ -499,12 +542,12 @@ build specifically (not left abstract).
 | Suggestion service | 3, 5 | `src/services/SuggestX.SuggestionService/` | Scaffolded, health-check only so far; real Redis-`GET` read path arrives Phase 5. |
 | Collection service | 5 | `src/services/SuggestX.CollectionService/` | `POST /search-events` validates and publishes to the `suggestx-search-events` Firehose delivery stream, awaiting durable acceptance before returning 202. Owns no store, holds no state. Phase 2, complete; the original in-memory buffer/flush-worker design was replaced by decision 11. |
 | Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | `RawLogPollingWorker` reads new `suggestx-raw-logs` objects on a timer via a sortable-key checkpoint, durably persisted in `suggestx-aggregator-checkpoints` (DynamoDB). `IPhraseFrequencyWriter` maps and reduces each batch's phrases into atomic `ADD`s against `suggestx-phrase-frequencies`, case-insensitive. Phase 3, complete (Modules 1–3). |
-| Trie builder | 5 | `src/services/SuggestX.TrieBuilder/` | `TrieBuildWorker` reads all of `suggestx-phrase-frequencies` on a timer and builds a fresh `CompressedTrie` (Phase 4 Module 1, verified against real branching data via `GET /_debug/search`), then flattens it to `prefix → top-N` and publishes a new versioned namespace into Redis via `RedisFlattenedCachePublisher`, deleting the previous version's keys only after the new one is fully written (Phase 4 Module 2, verified across three real build cycles — see decision 14). The S3 snapshot and ZooKeeper-coordinated durable version pointer arrive Module 3. |
+| Trie builder | 5 | `src/services/SuggestX.TrieBuilder/` | `TrieBuildWorker` reads all of `suggestx-phrase-frequencies` on a timer and builds a fresh `CompressedTrie` (Phase 4 Module 1, verified against real branching data via `GET /_debug/search`), flattens it to `prefix → top-N` and publishes a new versioned namespace into Redis via `RedisFlattenedCachePublisher` (Phase 4 Module 2, decision 14), then persists that same content to S3 (`S3TrieSnapshotStore`) and flips a ZooKeeper `current_version` znode (`ZooKeeperVersionPublisher`) — only after Redis already has it live — so a restart recovers the last published version instead of resetting to 1 (Phase 4 Module 3, decision 15, verified across a real container restart). Phase 4 is now complete. |
 | Web servers / entry point | 3 | `src/services/SuggestX.Gateway/` | YARP proxy, two routes (`/api/suggestions`, `/api/search-events`) live; no auth layer, since the source doc has no identity concept at all. |
 | HDFS | 4, 5 | `suggestx-raw-logs` (S3, LocalStack), written by the `suggestx-search-events` Firehose delivery stream, not directly by a service | `infra/localstack/init/01-bootstrap.sh`. See decision 3 (why S3) and decision 11 (why Firehose writes it instead of CollectionService). |
 | Cassandra | 4, 5 | `suggestx-phrase-frequencies` (DynamoDB, LocalStack) | Same script. See decision 3. |
 | MongoDB (trie doc store) | 5 | `suggestx-trie-snapshots` (S3, LocalStack) | Same script. See decision 3 — S3, not a document store, deliberately. |
-| ZooKeeper | 5 | `zookeeper:3.9` container (`docker-compose.yml`) | Real container, not simulated. See decision 4. Znode round-trip verified manually via `zkCli.sh` in Phase 1; the application-level client arrives with TrieBuilder in Phase 4. |
+| ZooKeeper | 5 | `zookeeper:3.9` container (`docker-compose.yml`); client wired in `SuggestX.ServiceDefaults/ZooKeeper/ZooKeeperClientFactory.cs` | Real container, not simulated. See decision 4. Znode round-trip verified manually via `zkCli.sh` in Phase 1; TrieBuilder is now the first real application-level writer (`current_version` znode, Phase 4 Module 3, decision 15). SuggestionService becomes the first reader in Phase 5. |
 | Redis (trie cache) | 3, 5 | `redis:7-alpine` container | Unchanged from the doc. `trie:*` namespace is written by TrieBuilder starting Phase 4. |
 
 ## §6 Coverage map
@@ -517,7 +560,7 @@ build specifically (not left abstract).
 | Offline trie updates (MapReduce-style) | ⬜ Designed, not built |
 | Collection service | ✅ Built and verified (Phase 2) |
 | Aggregator | ✅ Built and verified (Phase 3) |
-| Trie builder — S3 snapshot + ZooKeeper-coordinated version swap | ⬜ Designed, not built (Module 3) |
+| Trie builder — S3 snapshot + ZooKeeper-coordinated version swap | ✅ Built and verified (Phase 4 Module 3) |
 | Suggestion service (Redis-backed) | ⬜ Designed, not built |
 | Client-side optimizations (debounce, input threshold, local cache, early connection, edge cache) | ⬜ Designed, not built |
 | Personalization | ⬜ Designed, not built |

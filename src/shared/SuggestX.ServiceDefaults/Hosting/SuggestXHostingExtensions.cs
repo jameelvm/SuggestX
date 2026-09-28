@@ -12,6 +12,7 @@ using Scalar.AspNetCore;
 using StackExchange.Redis;
 using SuggestX.ServiceDefaults.Aws;
 using SuggestX.ServiceDefaults.Configuration;
+using SuggestX.ServiceDefaults.ZooKeeper;
 
 namespace SuggestX.ServiceDefaults.Hosting;
 
@@ -48,6 +49,10 @@ public static class SuggestXHostingExtensions
                 return ConnectionMultiplexer.Connect(configuration);
             });
         }
+
+        var zooKeeperConnection = builder.Configuration.GetSection(ZooKeeperOptions.SectionName)["ConnectionString"];
+        if (!string.IsNullOrWhiteSpace(zooKeeperConnection))
+            builder.Services.AddSuggestXZooKeeperClient();
 
         builder.Services.AddHealthChecks();
 
