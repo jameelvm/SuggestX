@@ -355,6 +355,99 @@ considered, and why this one won.
     disposable local dev cache; the failure mode itself is what Module 3
     now prevents going forward.
 
+16. **`SuggestionService` learns the current trie version by polling
+    ZooKeeper on a timer (5s default), not by registering a ZooKeeper
+    watch, and caches it in memory so no request ever makes its own
+    ZooKeeper call.** Polling was chosen for consistency, not because a
+    watch is wrong: every other cross-service handoff in this system is
+    already poll-based (Aggregator polling S3, TrieBuilder polling
+    DynamoDB) — a ZooKeeper watch would add real, distinct complexity (ZK
+    watches are one-shot and must be explicitly re-armed after every
+    fire, and a watch callback runs on the client library's own thread,
+    with its own reasoning about ordering and reconnection) for a benefit
+    — near-instant version pickup instead of up to ~5s of staleness —
+    that doesn't matter given decision 7 already accepts a staleness
+    window of minutes upstream of this. `RedisSuggestionReader` then does
+    exactly what decision 2 always meant literally: normalize the prefix
+    the same way Aggregator does, one Redis `GET` against
+    `trie:v{version}:{prefix}`, return whatever comes back.
+
+    Decision 6's over-bound fallback is implemented here, not deferred to
+    a future phase: a prefix longer than `MaxPrefixLength` is truncated to
+    the longest prefix TrieBuilder actually flattened, that prefix's
+    (already-small, at most `TopN`) candidate list is fetched once, and
+    filtered in-process to phrases that still start with everything the
+    user actually typed. This is a real degradation — a phrase that would
+    genuinely rank in the true top-N for the full prefix but fell outside
+    the truncated prefix's own top-N is missed — not a silently wrong
+    answer, and it costs nothing beyond the one Redis `GET` plus a trivial
+    string-prefix filter over at most `TopN` items, not a traversal.
+
+    **A real, accepted coupling, not closed here:** `SuggestionServiceOptions.MaxPrefixLength`
+    duplicates `TrieBuilder:MaxPrefixLength` as a separately-configured
+    default in an independently deployed service, with nothing enforcing
+    the two stay equal. If they drift, the symptom is subtle — prefixes in
+    the gap between the two configured bounds get the wrong behavior
+    (either fetched directly when TrieBuilder never flattened that length,
+    returning nothing, or needlessly truncated when TrieBuilder actually
+    had the real answer) — not a crash. Accepted as a real limitation
+    rather than building a mechanism (e.g. publishing the bound itself
+    through ZooKeeper or Redis) to keep two independently deployed
+    services' config in sync for a value that, in practice, essentially
+    never changes.
+
+    **Verified against the live stack:** `guitar`, `jazz`, and the `ja`
+    branch point (the same shared-segment case Module 1/2 verified)
+    returned identical results through `GET /suggestions` as through
+    TrieBuilder's own `/_debug/search`; `xyz` returned an empty list, not
+    an error; case normalization confirmed (`JAZZ` == `jazz`); a missing
+    `prefix` returned `400`; the identical request through the real
+    Gateway proxy returned an identical response. The over-bound fallback
+    was verified precisely: `guitar lesso` (13 characters, past the
+    6-character bound) correctly filtered down to exactly `guitar
+    lesson`, not all three guitar phrases — proving the filter
+    discriminates, not just truncates; `guitarzzz` correctly matched
+    nothing. Live version tracking was confirmed as an active loop, not a
+    one-time read at startup: `GET /suggestions/_debug/status` was
+    re-checked after TrieBuilder advanced and showed the cached version
+    catch up within one poll interval, unprompted.
+
+17. **A real gap in the "ZooKeeper unreachable degrades to stale, not
+    broken" claim, found by testing it live rather than trusting the
+    failure-mode table's own prior wording — not yet closed.** Stopping
+    the real `zookeeper` container confirmed the first half of the claim:
+    `CurrentVersionPoller` logs the connection failure and keeps serving
+    the last-known version, exactly as designed. But `TrieBuildWorker`'s
+    Redis blue/green cleanup (decision 14) does not pause when *its own*
+    ZooKeeper writes are failing — it keeps building, publishing new Redis
+    versions, and deleting the previous version's keys every cycle,
+    entirely independent of ZooKeeper reachability. An outage spanning
+    more than one TrieBuilder build cycle therefore lets Redis roll
+    forward past the exact version `SuggestionService` is still frozen on
+    — its keys get deleted out from under a "last known good" pointer
+    that is no longer actually good. A live `guitar` request during such
+    an outage returned an empty list, not stale-but-correct data — a real,
+    reproduced failure, not a hypothetical one. Restarting ZooKeeper let
+    both sides self-heal within one cycle each with no manual
+    intervention, confirmed live — so the failure is real but bounded and
+    self-correcting, not permanent.
+
+    **Not fixed here, deliberately, pending a decision:** two directions
+    are both plausible and neither is free. TrieBuilder could pause its
+    Redis *cleanup* specifically (not its publish) while it can't reach
+    ZooKeeper, trading "old keys pile up during an outage" for "no version
+    a client might be reading ever gets deleted out from under it."
+    Alternatively, `SuggestionService` could treat an empty Redis read
+    for a version it's fairly confident should have data as a signal to
+    re-poll immediately rather than wait a full interval — but an empty
+    read is also the genuinely correct answer for a real "no suggestions
+    for this prefix" case, so the two can't be told apart without extra
+    machinery (e.g. a canary key per version, or checking whether *any*
+    key under that version's namespace still exists, which is itself a
+    `SCAN` this project has otherwise deliberately avoided). This refines
+    the failure-mode table's own prior claim rather than just confirming
+    it — see the corrected row below.
+
 ## §2 Failure-mode table
 
 | Failure | Effect without mitigation | Mitigation in this build |
@@ -363,7 +456,8 @@ considered, and why this one won.
 | `TrieBuilder` restarts | Its version counter and previous-prefix-set could reset, overwriting `trie:v1:*` again and orphaning the prior version's keys forever | Mitigated (Module 3, decision 15): startup reads the ZooKeeper `current_version` znode and reloads that version's S3 snapshot, resuming the counter and previous-prefix-set instead of resetting them. Verified live across a real container restart. |
 | Aggregator falls behind (batch job takes longer than its own interval) | Frequencies grow stale, or two runs overlap and double-count | Aggregator checkpoints its S3 read offset per run; a run that overlaps the next start is a documented open question (see §4) rather than silently assumed away. |
 | Aggregator crashes between a successful frequency `ADD` and its checkpoint's durable write | A restart re-reads and re-counts that one batch, over-counting it | Not mitigated — accepted as a rare, self-bounded (at most one batch) overcount rather than adding an idempotency guard or a cross-table transaction. See decision 13. |
-| ZooKeeper unreachable | `SuggestionService` cannot learn the current version | Suggestion Service caches the last-known version/partition map in memory and continues serving it; a ZooKeeper outage degrades to "suggestions may go stale," not "suggestions stop." |
+| ZooKeeper unreachable, briefly (shorter than one TrieBuilder build cycle) | `SuggestionService` cannot learn the current version | Mitigated: it caches the last-known version in memory and keeps serving it — confirmed live by stopping the real container. |
+| ZooKeeper unreachable for longer than one TrieBuilder build cycle | TrieBuilder's own Redis cleanup keeps rotating versions regardless of ZooKeeper reachability, eventually deleting the exact version SuggestionService is still frozen on | Not mitigated — found and reproduced live (decision 17), not just theorized. Self-heals within one cycle once ZooKeeper recovers, with no permanent corruption, but requests during the window can return empty results rather than merely stale ones. |
 | A Redis partition is unreachable | Every query for that prefix range fails | Redis's own primary-replica replication (not hand-rolled app failover) is the mitigation — matches how a real deployment would actually solve this, rather than inventing bespoke failover code. |
 | A hot prefix range gets disproportionate load (e.g., everything starting "S") | One partition's servers overload while others idle | Named directly in the source doc as range partitioning's real weakness. Left as an open, unsolved question here (see §4) rather than hidden — a hash-based secondary partitioning layer is the real answer and is out of scope for this build. |
 | `PutRecord` to Firehose fails from `CollectionService` | Without care, the caller could get a false 202 for an event that was never durably accepted | `SearchEventsController` awaits `PutRecordAsync` before returning 202 and returns 503 on failure instead — the caller, not this service, decides whether to retry. See decision 11. |
@@ -534,12 +628,24 @@ build specifically (not left abstract).
   project whose point is demonstrating the pipeline shape, not
   operating it at production data volume. See §3's Q&A entry on this for
   the production-design options actually considered.
+- **A sustained ZooKeeper outage lets TrieBuilder's Redis cleanup delete
+  the exact version SuggestionService is still frozen on** — decision 17,
+  found and reproduced live, not theorized. Self-heals once ZooKeeper
+  recovers; not closed here. Two candidate fixes (pause TrieBuilder's
+  cleanup during an outage, or have SuggestionService distinguish a
+  "should have data" empty read from a genuine no-match) are named in
+  decision 17, neither implemented.
+- **`SuggestionServiceOptions.MaxPrefixLength` must be kept manually in
+  sync with `TrieBuilder:MaxPrefixLength`** — decision 16. Two
+  independently deployed services agreeing on a config value with nothing
+  enforcing it; accepted rather than built around, since the value is
+  essentially static in practice.
 
 ## §5 Doc-to-code map
 
 | Doc concept | Chapter | File(s) | Why this choice |
 |---|---|---|---|
-| Suggestion service | 3, 5 | `src/services/SuggestX.SuggestionService/` | Scaffolded, health-check only so far; real Redis-`GET` read path arrives Phase 5. |
+| Suggestion service | 3, 5 | `src/services/SuggestX.SuggestionService/` | `CurrentVersionPoller` polls ZooKeeper's `current_version` znode on a timer; `GET /suggestions?prefix=` (`SuggestionsController`) does one Redis `GET` against `trie:v{N}:{prefix}` via `RedisSuggestionReader`, with the decision-6 over-bound fallback (Phase 5 Module 1, decisions 16–17, verified live). SuggestionService is the first real reader of the ZooKeeper znode TrieBuilder writes. |
 | Collection service | 5 | `src/services/SuggestX.CollectionService/` | `POST /search-events` validates and publishes to the `suggestx-search-events` Firehose delivery stream, awaiting durable acceptance before returning 202. Owns no store, holds no state. Phase 2, complete; the original in-memory buffer/flush-worker design was replaced by decision 11. |
 | Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | `RawLogPollingWorker` reads new `suggestx-raw-logs` objects on a timer via a sortable-key checkpoint, durably persisted in `suggestx-aggregator-checkpoints` (DynamoDB). `IPhraseFrequencyWriter` maps and reduces each batch's phrases into atomic `ADD`s against `suggestx-phrase-frequencies`, case-insensitive. Phase 3, complete (Modules 1–3). |
 | Trie builder | 5 | `src/services/SuggestX.TrieBuilder/` | `TrieBuildWorker` reads all of `suggestx-phrase-frequencies` on a timer and builds a fresh `CompressedTrie` (Phase 4 Module 1, verified against real branching data via `GET /_debug/search`), flattens it to `prefix → top-N` and publishes a new versioned namespace into Redis via `RedisFlattenedCachePublisher` (Phase 4 Module 2, decision 14), then persists that same content to S3 (`S3TrieSnapshotStore`) and flips a ZooKeeper `current_version` znode (`ZooKeeperVersionPublisher`) — only after Redis already has it live — so a restart recovers the last published version instead of resetting to 1 (Phase 4 Module 3, decision 15, verified across a real container restart). Phase 4 is now complete. |
@@ -561,6 +667,6 @@ build specifically (not left abstract).
 | Collection service | ✅ Built and verified (Phase 2) |
 | Aggregator | ✅ Built and verified (Phase 3) |
 | Trie builder — S3 snapshot + ZooKeeper-coordinated version swap | ✅ Built and verified (Phase 4 Module 3) |
-| Suggestion service (Redis-backed) | ⬜ Designed, not built |
+| Suggestion service (Redis-backed) | ✅ Built and verified (Phase 5 Module 1) |
 | Client-side optimizations (debounce, input threshold, local cache, early connection, edge cache) | ⬜ Designed, not built |
 | Personalization | ⬜ Designed, not built |

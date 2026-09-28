@@ -1,16 +1,18 @@
 using SuggestX.ServiceDefaults.Hosting;
+using SuggestX.SuggestionService;
 
-// The hot read path. Owns no durable store of its own — every request is,
-// once Phase 5 fills this in, a single Redis GET against the flattened
-// prefix -> top-N cache TrieBuilder publishes. Module 1 exists only to prove
-// this process starts, joins the compose network, and answers a health check
-// before any real logic exists — see PROGRESS.md Phase 1.
+// The hot read path. Owns no durable store of its own — every request is
+// one Redis GET against the flattened prefix -> top-N cache TrieBuilder
+// publishes, against whichever version CurrentVersionPoller last learned
+// from ZooKeeper. No trie traversal, no DynamoDB/S3 access, ever
+// (DESIGN.md decision 2, decision 16).
 const string ServiceName = "SuggestionService";
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.AddSuggestXServiceDefaults(ServiceName);
 builder.AddSuggestXApiDefaults();
+builder.Services.AddSuggestionServiceServices(builder.Configuration);
 
 var app = builder.Build();
 

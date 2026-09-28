@@ -5,9 +5,10 @@
 Say this to Claude at the start of the next session:
 
 > Read PROGRESS.md and CLAUDE.md in C:\System Design\TypeheadSuggestion\App,
-> then start Phase 5 — Suggestion Service (the real read path: ZooKeeper
-> current-version lookup, then one Redis `GET`). Build it in short modules,
-> pausing after each one so I can review before you continue.
+> then continue Phase 5 — Suggestion Service. Module 1 (the real read path)
+> is done and verified; decide with me whether to close the ZooKeeper-outage
+> gap found during verification (decision 17) before moving on. Build in
+> short modules, pausing after each one so I can review before you continue.
 
 **Build in short modules.** One concept per module, verified and explained
 before moving on — same discipline as JameX.
@@ -58,7 +59,14 @@ ZooKeeper `current_version` znode) verified live across a genuine container
 restart: the restarted process recovered version 3 from ZooKeeper (not a
 reset to 1), published version 4 next, and correctly cleaned up exactly
 version 3's Redis keys — proven directly against Redis, S3, and ZooKeeper,
-not inferred from logs alone. Phase 5 (Suggestion Service) next.**
+not inferred from logs alone.
+**Phase 5 — Suggestion Service. Module 1 (the real read path) complete,
+verified live** — including a real, previously-undocumented gap found by
+testing the ZooKeeper-outage claim directly rather than trusting it: a
+long enough ZooKeeper outage lets TrieBuilder's Redis cleanup roll past
+the version SuggestionService is still frozen on, briefly serving empty
+results rather than merely stale ones. See decision 17 — not yet closed,
+open for discussion before continuing.**
 **Local debugging (cross-cutting, not a phase) — set up and verified.**
 Every service can now run under the Visual Studio debugger, on the exact
 port its container publishes, with the Gateway automatically reaching
@@ -573,30 +581,94 @@ correct, not an oversight.
       cleaned up because nothing durable remembered it needed to be —
       exactly the failure mode Module 3 now prevents going forward.
 
+- [x] **Phase 5 Module 1 — the real read path: ZooKeeper version lookup,
+      one Redis `GET`, the decision-6 over-bound fallback.**
+      `CurrentVersionPoller` (`Jobs/`) polls
+      `/suggestx/trie/current_version` on a timer (5s default) via a small,
+      SuggestionService-local `ZooKeeperVersionReader` — polling rather
+      than a ZooKeeper watch, for consistency with every other
+      cross-service handoff in this system already being poll-based, and
+      to avoid the real complexity of re-arming a one-shot ZK watch after
+      every fire for a benefit (near-instant pickup vs. a few seconds'
+      staleness) that doesn't matter given decision 7 already accepts a
+      much larger staleness window upstream. The learned version is cached
+      in `ICurrentTrieVersion` (`CurrentTrieVersionHolder`, the same
+      volatile-field pattern as TrieBuilder's own `ITrieHolder`) — a
+      request never triggers a ZooKeeper call itself.
+
+      `RedisSuggestionReader` (`Services/ISuggestionReader.cs`) does
+      exactly what decision 2 always meant literally: normalize the
+      prefix (`Trim().ToLowerInvariant()`, matching Aggregator's own
+      normalization so keys line up), one `StringGetAsync` against
+      `trie:v{version}:{prefix}`, deserialize, done — no trie, no
+      DynamoDB, no S3. Beyond `MaxPrefixLength` (decision 6's bound), it
+      truncates to the longest prefix TrieBuilder actually flattened,
+      fetches that, and filters the small candidate list down to phrases
+      that still start with everything the user actually typed — a real
+      degradation (a true top-N match outside the truncated prefix's own
+      top-N is missed), not a silently wrong answer.
+      `SuggestionsController` exposes `GET /suggestions?prefix=&limit=`,
+      already reachable through the Gateway's existing
+      `/api/suggestions/{**catch-all}` route from Phase 1.
+
+      **Verified against the live stack, extensively:** `guitar`, `jazz`,
+      and the `ja` branch point (landing on both "java" and "jazz")
+      all returned correctly ranked results identical to TrieBuilder's own
+      `/_debug/search`; `xyz` correctly returned an empty list, not an
+      error; `JAZZ` (uppercase) returned results identical to `jazz`,
+      confirming normalization; a missing `prefix` returned `400`; the
+      same request through the real Gateway proxy (`/api/suggestions`)
+      returned an identical response to the direct call. The over-bound
+      fallback was verified precisely, not just "doesn't crash": `guitar
+      lesso` (13 characters, past the 6-character bound) correctly
+      truncated to `guitar`, fetched all three guitar phrases, and
+      filtered down to exactly `guitar lesson` — proving the filter
+      genuinely discriminates, not just truncates; `guitarzzz` (matches
+      no real phrase) correctly returned empty rather than a false
+      positive. `limit` was verified to actually bound the result count.
+      Live version tracking was verified as an active loop, not a
+      one-time read: `GET /suggestions/_debug/status` matched
+      TrieBuilder's own reported version, and re-checking a few seconds
+      later after TrieBuilder advanced showed SuggestionService's cached
+      version catch up on its own, unprompted.
+
+      **A real gap found by testing the ZooKeeper-unreachable claim
+      live, not by inspection — see decision 17 and the corrected
+      failure-mode row below:** stopping the real `zookeeper` container
+      confirmed the poller logs the connection failure and keeps serving
+      the last-known version (as the failure-mode table already claimed)
+      — but because TrieBuilder's own Redis blue/green cleanup
+      (Module 2) keeps running every build cycle regardless of whether
+      *its* ZooKeeper writes are succeeding, an outage spanning more than
+      one TrieBuilder build cycle lets Redis roll forward and delete the
+      exact version SuggestionService is still frozen on, pointing it at
+      keys that no longer exist. A `guitar` request during the outage
+      window returned an empty list — a real, live-reproduced gap, not a
+      hypothetical one. Restarting ZooKeeper let both sides self-heal
+      within one cycle each with no manual intervention, confirmed live.
+      This refines — not just confirms — what "degrades to stale" means
+      in this table: true only for outages shorter than one TrieBuilder
+      cycle.
+
 ### In progress
 
-Nothing — Phase 4 complete and verified end to end, all three modules.
+Nothing — Phase 5 Module 1 verified, including a real gap found and
+documented (decision 17). Not yet closed — see DESIGN.md §4.
 
 ### Next up (immediate)
 
-**Phase 5 — Suggestion Service**, not started:
+**Phase 5 — Suggestion Service**, continued:
 
-1. Read path: on startup and periodically, read
-   `/suggestx/trie/current_version` from ZooKeeper to know which
-   `trie:v{N}:*` Redis namespace is live; `GET /api/suggestions?prefix=`
-   does one Redis `GET` against that namespace and returns the top-N —
-   no trie traversal, no DynamoDB/S3 access, matching decision 2's whole
-   point.
-2. Decide and document how the service reacts to a version change
-   mid-flight (poll ZooKeeper on an interval vs. a watch-triggered
-   callback) and what it serves if Redis or ZooKeeper is briefly
-   unreachable (decision: cache the last-known version/serve stale rather
-   than fail the request — see the failure-mode table's existing "Redis
-   partition unreachable" row).
-3. Verify: real requests through `GET /api/suggestions` for prefixes
-   TrieBuilder has already published return correct top-N results with
-   real latency measured, not just correctness; confirm a new TrieBuilder
-   version becomes visible to SuggestionService without a restart.
+2. Decide whether the ZooKeeper-outage gap (decision 17) is worth closing
+   here — e.g. TrieBuilder pausing its own Redis cleanup (not its
+   publish) while it can't reach ZooKeeper, or SuggestionService treating
+   an empty Redis read for a *known-populated* prefix as a signal to
+   re-poll immediately rather than waiting a full interval — or accepted
+   as a documented, bounded gap the way decisions 9/13 were.
+3. Latency measurement under real (if small-scale) load — the doc's own
+   NFR is "under 200ms"; verify with more than manual `curl` timing.
+4. Gateway + frontend (Phase 6) will be the first real exercise of this
+   read path end to end from a browser.
 
 ---
 
@@ -618,8 +690,10 @@ Ordered. Each phase leaves the build green **and** updates `README.md` and
    and S3 snapshot persistence + a real ZooKeeper `current_version` znode
    (Module 3), all verified against real branching data, real build
    cycles, and a genuine container restart.
-5. **Suggestion Service** — read path: ZooKeeper partition/version lookup →
-   Redis `GET` → top-N response. Not started.
+5. **Suggestion Service** — read path done (Module 1): ZooKeeper version
+   lookup → Redis `GET` → top-N response, verified live including the
+   decision-6 over-bound fallback. A real ZooKeeper-outage gap found and
+   documented (decision 17), open for a decision on whether to close it.
 6. **Gateway + frontend** — YARP routing, a real debounced search box, an
    insights panel showing live trie version/partition state and aggregation
    lag. Not started.
