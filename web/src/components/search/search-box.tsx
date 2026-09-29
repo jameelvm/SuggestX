@@ -11,6 +11,12 @@ import type { SuggestionItem } from "@/types/suggestions";
 
 const DEBOUNCE_MS = 300;
 
+// The doc's own "input threshold" latency lever: below this many
+// characters, a prefix is too unspecific for a suggestion to be
+// meaningfully useful, and firing a request anyway is pure waste — the
+// same reasoning as debounce, applied to length instead of time.
+const MIN_QUERY_LENGTH = 2;
+
 /**
  * Phase 5's read path, finally exercised from a real browser: type a
  * prefix, wait for typing to pause (the doc's own debounce lever, not a
@@ -55,12 +61,12 @@ export function SearchBox() {
   const trimmedQuery = debouncedQuery.trim();
 
   useEffect(() => {
-    // Nothing to fetch for an empty query — deliberately not clearing
-    // `suggestions`/`error` state here too: that would be a setState call
-    // synchronous within the effect body for no benefit, since the render
-    // below already derives what's actually shown from `trimmedQuery`
-    // directly rather than trusting stale fetched state in this case.
-    if (trimmedQuery.length === 0) return;
+    // Nothing to fetch below the input threshold — deliberately not
+    // clearing `suggestions`/`error` state here too: that would be a
+    // setState call synchronous within the effect body for no benefit,
+    // since the render below already derives what's actually shown from
+    // `trimmedQuery` directly rather than trusting stale fetched state.
+    if (trimmedQuery.length < MIN_QUERY_LENGTH) return;
 
     const requestId = ++latestRequestId.current;
 
@@ -83,8 +89,8 @@ export function SearchBox() {
       });
   }, [trimmedQuery]);
 
-  const visibleSuggestions = trimmedQuery.length === 0 ? [] : suggestions;
-  const visibleError = trimmedQuery.length === 0 ? null : error;
+  const visibleSuggestions = trimmedQuery.length < MIN_QUERY_LENGTH ? [] : suggestions;
+  const visibleError = trimmedQuery.length < MIN_QUERY_LENGTH ? null : error;
 
   function submit(term: string) {
     const trimmed = term.trim();

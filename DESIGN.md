@@ -662,6 +662,63 @@ considered, and why this one won.
     first with a visible "recent" badge, confirmed via network inspection
     that the request genuinely carried `recent=guitar+solo`.
 
+22. **The doc's remaining client-side latency levers — input threshold,
+    a local response cache, early connection, and edge-cache headers —
+    built as four small, independent pieces, not one bundled mechanism.**
+    Input threshold (`MIN_QUERY_LENGTH = 2`) is the same reasoning as
+    debounce, applied to length instead of time: below two characters, a
+    prefix is too unspecific for a suggestion to be worth fetching at
+    all. Early connection is a server-rendered
+    `<link rel="preconnect">`/`dns-prefetch"` to the Gateway's origin in
+    `RootLayout` — rendered in the initial HTML specifically so the
+    browser opens the TCP/TLS handshake while the page is still being
+    parsed, not after the first debounced keystroke already needs it.
+
+    The edge-cache header (`Cache-Control: public, max-age=5` on every
+    `GET /suggestions` response) and the client's matching local cache
+    are the same lever at two different hops, deliberately kept in sync:
+    the client cache's TTL equals the server's own `max-age`, so the
+    browser never holds a response staler than what the server itself
+    already claims is fresh. `public`, not `private`, is a real, correct
+    choice here, not carelessness — this system has no cookies or
+    sessions (CLAUDE.md's "no identity concept"), so a personalized
+    response is already fully determined by its own URL (the `recent`
+    parameter *is* the personalization), which is exactly the property
+    that makes a shared cache safe to key by URL normally.
+
+    **A real debugging story worth recording, not smoothing over:**
+    verifying the local cache through the dev server initially looked
+    broken — every backspace-and-retype produced a fresh network
+    request, every time. Root-caused via direct instrumentation
+    (temporary logging inside the cache's own read/write functions) to
+    two genuinely separate causes, neither a flaw in the cache logic:
+
+    1. React's Strict Mode — on by default in Next.js development
+       builds, off in production — intentionally double-invokes effects
+       to help developers catch missing cleanup. Two near-simultaneous
+       `fetchSuggestions` calls for the same prefix both read the cache
+       before either's write had landed, so both raced past it as
+       misses. Confirmed by the double disappearing entirely in a real
+       `next build && next start` run.
+    2. The 5-second TTL was, independently, consistently shorter than
+       this session's own multi-step browser-automation verification
+       process — each screenshot, console read, and network check in
+       this environment costs real, multi-second wall-clock time, so
+       entries kept legitimately expiring *between* test steps. Not a
+       caching failure — correct, honest behavior against a "retype"
+       far slower than any real person's.
+
+    Resolved by testing against an actual production build, batching
+    actions into one fast round trip (browser automation's own overhead
+    was the confound, so minimizing it was the fix) and reading the
+    instrumentation directly: a first call logged a miss then a write; a
+    second call roughly two seconds later logged `hit=true` with no
+    further write and no new network request — conclusive proof the
+    mechanism works exactly as designed. Debug instrumentation was
+    removed afterward, and the dev server (temporarily replaced by a
+    production server for this specific verification) was restarted and
+    re-confirmed working before moving on.
+
 ## §2 Failure-mode table
 
 | Failure | Effect without mitigation | Mitigation in this build |
@@ -861,12 +918,12 @@ build specifically (not left abstract).
 
 | Doc concept | Chapter | File(s) | Why this choice |
 |---|---|---|---|
-| Suggestion service | 3, 5 | `src/services/SuggestX.SuggestionService/` | `CurrentVersionPoller` polls ZooKeeper's `current_version` znode on a timer; `GET /suggestions?prefix=` (`SuggestionsController`) does one Redis `GET` against `trie:v{N}:{prefix}` via `RedisSuggestionReader`, with the decision-6 over-bound fallback (Phase 5 Module 1, decisions 16–17, verified live). SuggestionService is the first real reader of the ZooKeeper znode TrieBuilder writes. An optional `recent` parameter reorders (never injects) within that same candidate set for personalization (Phase 7 Module 1, decision 21). |
+| Suggestion service | 3, 5 | `src/services/SuggestX.SuggestionService/` | `CurrentVersionPoller` polls ZooKeeper's `current_version` znode on a timer; `GET /suggestions?prefix=` (`SuggestionsController`) does one Redis `GET` against `trie:v{N}:{prefix}` via `RedisSuggestionReader`, with the decision-6 over-bound fallback (Phase 5 Module 1, decisions 16–17, verified live). SuggestionService is the first real reader of the ZooKeeper znode TrieBuilder writes. An optional `recent` parameter reorders (never injects) within that same candidate set for personalization (Phase 7 Module 1, decision 21). Every response also carries `Cache-Control: public, max-age=5` (Phase 7 Module 2, decision 22). |
 | Collection service | 5 | `src/services/SuggestX.CollectionService/` | `POST /search-events` validates and publishes to the `suggestx-search-events` Firehose delivery stream, awaiting durable acceptance before returning 202. Owns no store, holds no state. Phase 2, complete; the original in-memory buffer/flush-worker design was replaced by decision 11. |
 | Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | `RawLogPollingWorker` reads new `suggestx-raw-logs` objects on a timer via a sortable-key checkpoint, durably persisted in `suggestx-aggregator-checkpoints` (DynamoDB). `IPhraseFrequencyWriter` maps and reduces each batch's phrases into atomic `ADD`s against `suggestx-phrase-frequencies`, case-insensitive. Phase 3, complete (Modules 1–3). |
 | Trie builder | 5 | `src/services/SuggestX.TrieBuilder/` | `TrieBuildWorker` reads all of `suggestx-phrase-frequencies` on a timer and builds a fresh `CompressedTrie` (Phase 4 Module 1, verified against real branching data via `GET /_debug/search`), flattens it to `prefix → top-N` and publishes a new versioned namespace into Redis via `RedisFlattenedCachePublisher` (Phase 4 Module 2, decision 14), then persists that same content to S3 (`S3TrieSnapshotStore`) and flips a ZooKeeper `current_version` znode (`ZooKeeperVersionPublisher`) — only after Redis already has it live — so a restart recovers the last published version instead of resetting to 1 (Phase 4 Module 3, decision 15, verified across a real container restart). Phase 4 is now complete. |
 | Web servers / entry point | 3 | `src/services/SuggestX.Gateway/` | YARP proxy, four routes live: `/api/suggestions`, `/api/search-events` (Phase 1), plus `/api/aggregator` and `/api/trie-builder` (Phase 6 Module 3, decision 20 — debug-only, for the insights panel, both services' first caller-facing route of any kind). No auth layer, since the source doc has no identity concept at all. |
-| Client (the doc's implicit browser/app calling both APIs) | 2, 5 | `web/` | Hand-written Next.js 16 App Router app (not CLI-scaffolded — see decision 18), mirroring JameX's own `web/` conventions. `SearchBox` debounces input (`useDebouncedValue`, 300ms) and calls `GET /api/suggestions` through the Gateway (Module 1); submitting a search calls `POST /api/search-events` and records it in a `localStorage` recent-search cache (Module 2, decision 19; the cache itself, Phase 7 Module 1, decision 21); `/insights` polls every service's `/_debug/status` plus TrieBuilder's new `/_debug/tree` every 2s and renders a real SVG graph of the live trie (Module 3, decision 20). All verified live in a real browser. |
+| Client (the doc's implicit browser/app calling both APIs) | 2, 5 | `web/` | Hand-written Next.js 16 App Router app (not CLI-scaffolded — see decision 18), mirroring JameX's own `web/` conventions. `SearchBox` debounces input (`useDebouncedValue`, 300ms) and enforces a minimum query length before fetching (Module 1; the input threshold, Phase 7 Module 2, decision 22) and calls `GET /api/suggestions` through the Gateway; submitting a search calls `POST /api/search-events` and records it in a `localStorage` recent-search cache (Module 2, decision 19; the cache itself, Phase 7 Module 1, decision 21); `/insights` polls every service's `/_debug/status` plus TrieBuilder's new `/_debug/tree` every 2s and renders a real SVG graph of the live trie (Module 3, decision 20). `fetchSuggestions` also holds a short-TTL local response cache and `RootLayout` preconnects to the Gateway's origin (Phase 7 Module 2, decision 22). All verified live in a real browser. |
 | HDFS | 4, 5 | `suggestx-raw-logs` (S3, LocalStack), written by the `suggestx-search-events` Firehose delivery stream, not directly by a service | `infra/localstack/init/01-bootstrap.sh`. See decision 3 (why S3) and decision 11 (why Firehose writes it instead of CollectionService). |
 | Cassandra | 4, 5 | `suggestx-phrase-frequencies` (DynamoDB, LocalStack) | Same script. See decision 3. |
 | MongoDB (trie doc store) | 5 | `suggestx-trie-snapshots` (S3, LocalStack) | Same script. See decision 3 — S3, not a document store, deliberately. |
@@ -886,5 +943,5 @@ build specifically (not left abstract).
 | Trie builder — S3 snapshot + ZooKeeper-coordinated version swap | ✅ Built and verified (Phase 4 Module 3) |
 | Suggestion service (Redis-backed) | ✅ Built and verified (Phase 5 Module 1) |
 | Client-side optimization — debounce | ✅ Built and verified (Phase 6 Module 1) |
-| Client-side optimizations — input threshold, local cache, early connection, edge cache | ⬜ Designed, not built |
+| Client-side optimizations — input threshold, local cache, early connection, edge cache | ✅ Built and verified (Phase 7 Module 2) |
 | Personalization | ✅ Built and verified (Phase 7 Module 1) |

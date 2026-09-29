@@ -38,6 +38,12 @@ public sealed class SuggestionsController(
         var recentPhrases = ParseRecent(recent);
         var result = await reader.GetTopMatchesAsync(prefix, effectiveLimit, recentPhrases, ct);
 
+        // The doc's "edge cache" client-side lever: a real CDN/browser cache
+        // in front of this Gateway would honor this and skip the round trip
+        // entirely for a repeated identical request. `public` is correct,
+        // not loose, here — see SuggestionServiceOptions.CacheMaxAgeSeconds.
+        Response.Headers.CacheControl = $"public, max-age={options.Value.CacheMaxAgeSeconds}";
+
         return Ok(new SuggestionResponse(prefix, result.Items, result.PersonalizedPhrases));
     }
 

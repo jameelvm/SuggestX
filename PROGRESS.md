@@ -5,9 +5,9 @@
 Say this to Claude at the start of the next session:
 
 > Read PROGRESS.md and CLAUDE.md in C:\System Design\TypeheadSuggestion\App,
-> then continue Phase 7 — evaluation extras. Module 1 (personalization)
-> is done and verified live; next is remaining client-side optimizations
-> beyond debounce, then fault-tolerance verification. Build in short
+> then continue Phase 7 — evaluation extras. Modules 1-2 (personalization,
+> remaining client-side optimizations + edge-cache headers) are done and
+> verified live; next is fault-tolerance verification. Build in short
 > modules, pausing after each one so I can review before you continue.
 
 **Build in short modules.** One concept per module, verified and explained
@@ -87,8 +87,12 @@ no server-side profile) sent on every suggestions request,
 existing candidate set. Confirmed both via direct API calls and in a
 real browser: submitting "guitar solo," then re-searching "guitar,"
 correctly promoted it to first place with a visible "recent" badge.
-Remaining client-side optimizations and fault-tolerance verification
-next.**
+Module 2 (remaining client-side optimizations + a real edge-cache
+header) complete, verified live — including root-causing a real
+verification confusion (React Strict Mode's dev-only double-effect
+firing two near-simultaneous fetches) down to a clean proof against a
+real production build rather than dismissing it. Fault-tolerance
+verification next.**
 **Local debugging (cross-cutting, not a phase) — set up and verified.**
 Every service can now run under the Visual Studio debugger, on the exact
 port its container publishes, with the Gateway automatically reaching
@@ -928,16 +932,72 @@ correct, not an oversight.
       carried `recent=guitar+solo`. Zero console errors. `npm run build`
       and `npx eslint .` both pass clean; the .NET solution builds clean.
 
+- [x] **Phase 7 Module 2 — the doc's remaining client-side levers: input
+      threshold, a local response cache, early connection, and a real
+      edge-cache header.** `SearchBox` gained `MIN_QUERY_LENGTH` (2) —
+      below that, no suggestions fetch fires at all, the same reasoning
+      as debounce applied to length instead of time. `RootLayout` renders
+      `<link rel="preconnect">`/`dns-prefetch"` to the Gateway's origin
+      server-side, so the browser opens the connection while the page's
+      `<head>` is still being parsed, before the first debounced keystroke
+      would otherwise trigger it. `SuggestionsController` now sets
+      `Cache-Control: public, max-age=5` on every response —
+      `public`, not `private`, deliberately: this system has no cookies
+      or sessions, so a personalized response is already fully determined
+      by its own URL (the `recent` parameter *is* the personalization),
+      which is exactly what makes a shared cache safe to key by URL the
+      ordinary way. `fetchSuggestions` gained a matching in-memory local
+      cache (same 5s TTL as the server's own header — a client cache
+      shouldn't outlive the freshness window the server itself claims),
+      keyed by the full request (prefix + recent list), so backspacing
+      and retyping a prefix already fetched this session skips the
+      network round trip.
+
+      **A real debugging story, not a clean first pass:** verifying the
+      local cache through the dev server initially looked broken — every
+      retype produced a new network request. Root-caused via direct
+      instrumentation (temporary logging of cache reads/writes) to two
+      *separate*, real causes, neither a bug in the cache logic itself:
+      (1) React's Strict Mode (on by default in Next.js dev builds)
+      double-invokes effects, firing two near-simultaneous
+      `fetchSuggestions` calls that both raced past the cache before
+      either's write could land — a dev-only artifact, confirmed absent
+      in a real `next build && next start` production run; (2) the
+      5-second TTL was consistently shorter than this session's own
+      slow, multi-step verification process (browser automation
+      round-trips take real, multi-second wall-clock time), so entries
+      kept legitimately expiring between test steps — not a caching
+      failure, correct behavior against an unrealistically slow
+      "retype." Conclusively verified against a real production build,
+      batching actions into one fast round trip and reading the actual
+      cache instrumentation: a first `fetchSuggestions("gu")` logged a
+      miss then a write; a second call ~2 seconds later logged `hit=true`
+      with no further write and no new network request. Debug
+      instrumentation removed afterward; the dev server (which had been
+      temporarily replaced by a production server for this verification)
+      was restarted, and a final check confirmed personalization,
+      ranking, and the badge all still render correctly on it.
+
+      **Verified independently, live:** the `Cache-Control` header
+      confirmed present via `curl -i` against the real running
+      `SuggestionService`; the preconnect/dns-prefetch links confirmed
+      present in the actual rendered `<head>` via a direct DOM query in
+      the browser; the input threshold confirmed live — typing a single
+      character produced zero network requests, typing a second
+      character crossed the threshold and fired exactly one. `npm run
+      build` and `npx eslint .` both pass clean; the .NET solution
+      builds clean.
+
 ### In progress
 
-Nothing — Phase 7 Module 1 (personalization) verified live, both via
-direct API calls and in a real browser.
+Nothing — Phase 7 Module 2 (remaining client-side optimizations +
+edge-cache headers) verified live, including root-causing and resolving
+a real dev-mode-only verification confusion (React Strict Mode's
+double-effect-invocation) rather than papering over it.
 
 ### Next up (immediate)
 
-**Phase 7 — Evaluation extras**, continued: remaining client-side
-optimizations beyond debounce (input threshold, local cache, early
-connection, edge-cache headers), and fault-tolerance verification
+**Phase 7 — Evaluation extras**, continued: fault-tolerance verification
 (deliberately killing ZooKeeper/Redis/TrieBuilder mid-cycle and
 confirming the failure-mode table's mitigations — and its one corrected,
 not-fully-mitigated row, decision 17 — actually hold as documented).
@@ -974,11 +1034,12 @@ Ordered. Each phase leaves the build green **and** updates `README.md` and
    action watched updating a second, never-reloaded tab.
 7. **Evaluation extras** — personalization done (Module 1, blending a
    client-cached recent-search list with global ranking, verified live).
-   Client-side optimizations beyond debounce (input threshold, early
-   connection, edge-cache headers) and fault-tolerance verification (kill
-   ZooKeeper/a Redis partition/TrieBuilder mid-cycle and confirm the
-   failure-mode table's mitigations — and decision 17's corrected,
-   not-fully-mitigated row — actually hold as documented) remain.
+   Client-side optimizations beyond debounce done too (Module 2: input
+   threshold, local cache, early connection, a real edge-cache header,
+   verified live). Fault-tolerance verification (kill ZooKeeper/a Redis
+   partition/TrieBuilder mid-cycle and confirm the failure-mode table's
+   mitigations — and decision 17's corrected, not-fully-mitigated row —
+   actually hold as documented) remains.
 
 ---
 
