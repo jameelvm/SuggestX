@@ -5,11 +5,10 @@
 Say this to Claude at the start of the next session:
 
 > Read PROGRESS.md and CLAUDE.md in C:\System Design\TypeheadSuggestion\App,
-> then start Phase 7 — evaluation extras (personalization, remaining
-> client-side optimizations, fault-tolerance verification). Phase 6 is
-> fully complete, including a real-time insights panel with a graphical
-> trie view. Build in short modules, pausing after each one so I can
-> review before you continue.
+> then continue Phase 7 — evaluation extras. Module 1 (personalization)
+> is done and verified live; next is remaining client-side optimizations
+> beyond debounce, then fault-tolerance verification. Build in short
+> modules, pausing after each one so I can review before you continue.
 
 **Build in short modules.** One concept per module, verified and explained
 before moving on — same discipline as JameX.
@@ -80,8 +79,16 @@ browser tab. Module 3: a real-time insights panel with a genuine SVG
 graph of TrieBuilder's own live trie — watched, in a second browser tab
 that was never reloaded, real numbers and a real new graph node appear
 within seconds of submitting a search in the first tab. New Gateway
-routes expose Aggregator/TrieBuilder for the first time. Phase 7
-(evaluation extras) next.**
+routes expose Aggregator/TrieBuilder for the first time.**
+**Phase 7 — Evaluation extras. Module 1 (personalization) complete,
+verified live** — a client-side recent-search cache (`localStorage`,
+no server-side profile) sent on every suggestions request,
+`SuggestionService` reordering (never injecting) matches within the
+existing candidate set. Confirmed both via direct API calls and in a
+real browser: submitting "guitar solo," then re-searching "guitar,"
+correctly promoted it to first place with a visible "recent" badge.
+Remaining client-side optimizations and fault-tolerance verification
+next.**
 **Local debugging (cross-cutting, not a phase) — set up and verified.**
 Every service can now run under the Visual Studio debugger, on the exact
 port its container publishes, with the Gateway automatically reaching
@@ -870,18 +877,67 @@ correct, not an oversight.
 
 **Phase 6 is now complete — all three modules.**
 
+- [x] **Phase 7 Module 1 — personalization: a client-cached recent-search
+      list blended with the shared global ranking.** Exactly the design
+      already recorded in DESIGN.md's Q&A (shared trie, not a per-user
+      one; a small client-side recent-search cache; blended at merge
+      time in `SuggestionService`) — built for real.
+
+      `SuggestionResponse` (Contracts) gained `PersonalizedPhrases`, the
+      list of phrases in this response that were reordered ahead of
+      their global ranking; `SuggestionItem` itself is untouched, since
+      it's also the exact shape TrieBuilder persists to Redis/S3, and
+      personalization has no business touching that. `ISuggestionReader`
+      now takes the caller's recent-phrase list and reorders — never
+      injects — within the candidate set the flattened cache already
+      returned: boosted matches first (in their existing frequency
+      order), then everything else, truncated to `limit` only at the
+      end, so a personally-recent phrase ranked just outside the
+      requested limit can still be promoted into view. Deliberately
+      stays inside decision 2's boundary — no DynamoDB lookup by exact
+      phrase to fetch a "real" frequency for something outside the
+      already-fetched candidates, which would mean SuggestionService
+      touching a store it's architecturally never supposed to touch.
+      `GET /suggestions` gained an optional `recent` query parameter
+      (comma-separated phrases).
+
+      `web/src/lib/recent-searches.ts` is the client half — a small
+      `localStorage`-backed list (max 10, most-recent-first,
+      case-insensitive dedupe), read on every `fetchSuggestions` call and
+      written whenever a search is actually submitted (Module 2's own
+      submit path). No server-side profile of any kind, matching this
+      system's "no identity concept" architecture — the browser simply
+      resends its own small history on every request. `SearchBox` shows
+      a small green "recent" badge on any suggestion the server reports
+      as personalized, so the effect is visibly demonstrable, not just
+      present in response JSON.
+
+      **Verified against the live stack, both directly and in a real
+      browser:** `curl` against `SuggestionService` directly confirmed
+      the core reordering — `guitar` normally returns `chords, lesson,
+      solo` (tied at frequency 1, alphabetical tie-break); with
+      `recent=guitar solo` it returns `solo, chords, lesson` with
+      `personalizedPhrases: ["guitar solo"]`; case-insensitive matching,
+      a non-matching recent phrase (no effect), and multiple recent
+      phrases all confirmed correct; same result through the real
+      Gateway proxy. Then, in an actual Chrome browser: typed `guitar`
+      (baseline: chords, lesson, solo, no badges) → picked `guitar solo`
+      as a real submission → retyped `guitar` → it now rendered `guitar
+      solo` first with a "recent" badge, `chords`/`lesson` after —
+      confirmed via network inspection that the request genuinely
+      carried `recent=guitar+solo`. Zero console errors. `npm run build`
+      and `npx eslint .` both pass clean; the .NET solution builds clean.
+
 ### In progress
 
-Nothing — Phase 6 fully verified: the search box, submitting a search,
-and the real-time insights panel with a live trie graph, all confirmed
-live in a real browser.
+Nothing — Phase 7 Module 1 (personalization) verified live, both via
+direct API calls and in a real browser.
 
 ### Next up (immediate)
 
-**Phase 7 — Evaluation extras**, not started: personalization
-(blend client-cached recent searches with global ranking), remaining
-client-side optimizations beyond debounce (input threshold, local cache,
-early connection, edge-cache headers), and fault-tolerance verification
+**Phase 7 — Evaluation extras**, continued: remaining client-side
+optimizations beyond debounce (input threshold, local cache, early
+connection, edge-cache headers), and fault-tolerance verification
 (deliberately killing ZooKeeper/Redis/TrieBuilder mid-cycle and
 confirming the failure-mode table's mitigations — and its one corrected,
 not-fully-mitigated row, decision 17 — actually hold as documented).
@@ -916,13 +972,13 @@ Ordered. Each phase leaves the build green **and** updates `README.md` and
    panel with a graphical trie view (Module 3) — all verified live in a
    browser, including a full pipeline round trip from a single browser
    action watched updating a second, never-reloaded tab.
-7. **Evaluation extras** — personalization (blend client-cached recent
-   searches with global ranking), client-side optimizations beyond
-   debounce (input threshold, early connection, edge-cache headers),
-   fault-tolerance verification (kill ZooKeeper/a Redis partition/
-   TrieBuilder mid-cycle and confirm the failure-mode table's
-   mitigations — and decision 17's corrected, not-fully-mitigated row —
-   actually hold as documented). Not started.
+7. **Evaluation extras** — personalization done (Module 1, blending a
+   client-cached recent-search list with global ranking, verified live).
+   Client-side optimizations beyond debounce (input threshold, early
+   connection, edge-cache headers) and fault-tolerance verification (kill
+   ZooKeeper/a Redis partition/TrieBuilder mid-cycle and confirm the
+   failure-mode table's mitigations — and decision 17's corrected,
+   not-fully-mitigated row — actually hold as documented) remain.
 
 ---
 

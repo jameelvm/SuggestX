@@ -616,6 +616,52 @@ considered, and why this one won.
     perfume" pair renders with clean, non-overlapping labels; the page
     visibly uses the full window width.
 
+21. **Personalization is built exactly as this doc's own Q&A already
+    committed to: a shared trie, never a per-user one, with a small
+    client-side recent-search cache blended in at merge time inside
+    `SuggestionService` — never a separate candidate source.**
+    `SuggestionResponse` gained `PersonalizedPhrases` (which returned
+    entries were reordered); `SuggestionItem` itself stays untouched,
+    since it's also the exact shape TrieBuilder persists to Redis and S3
+    — personalization has no business reshaping a type two unrelated
+    services depend on for something that's purely a response-time
+    display concern.
+
+    The reordering happens *only* within the candidate set the flattened
+    cache already returned for this prefix — boosted matches (present in
+    the caller's own recent list) first, in their existing frequency
+    order, then everything else, with `limit` applied only at the very
+    end so a personally-relevant phrase ranked just outside the
+    requested limit can still surface. Deliberately never looks up an
+    exact phrase's real frequency in DynamoDB to justify injecting a
+    candidate the trie's own top-N didn't already surface — that would
+    mean `SuggestionService` touching a store this whole system's
+    architecture (decision 2) says it never does, just to serve a
+    stretch feature. A phrase the user has personally searched but that
+    isn't among this prefix's globally-flattened top-N simply isn't
+    something personalization can promote — a real, accepted limitation
+    of staying inside the existing boundary, not an oversight.
+
+    There is no server-side user profile, matching this system's
+    explicit "no identity concept" design (CLAUDE.md, decision 1's
+    reasoning extended): the browser's own `localStorage` (capped at 10
+    entries, most-recent-first, case-insensitive dedupe) is resent as a
+    plain `recent` query parameter on every suggestions request, and
+    `SuggestionService` never stores or remembers it between requests.
+
+    **Verified against the live stack, both directly and in a browser:**
+    `guitar` normally returns `chords, lesson, solo` — three phrases tied
+    at frequency 1, ordered only by the alphabetical tie-break. With
+    `recent=guitar solo` it returns `solo, chords, lesson` with
+    `personalizedPhrases: ["guitar solo"]` — confirmed case-insensitive
+    matching, a non-matching recent phrase having no effect, and multiple
+    recent phrases all promoting correctly, both direct to
+    `SuggestionService` and through the real Gateway proxy. In an actual
+    Chrome browser: typed `guitar` (baseline order, no badges), picked
+    `guitar solo` as a real submission, retyped `guitar` — it rendered
+    first with a visible "recent" badge, confirmed via network inspection
+    that the request genuinely carried `recent=guitar+solo`.
+
 ## §2 Failure-mode table
 
 | Failure | Effect without mitigation | Mitigation in this build |
@@ -693,10 +739,12 @@ build specifically (not left abstract).
 - **Q: Should the trie be built per-user or shared among all users?**
   A: Shared — a per-user trie at any real scale multiplies storage and build
   cost by the user count for a feature (personalization) that the doc itself
-  frames as a *ranking* adjustment, not a *candidate set* adjustment. This
-  build's stretch personalization phase blends a user's own recent-search
-  cache (client-side, small) with the shared global ranking at merge time in
-  `SuggestionService`, rather than maintaining separate tries.
+  frames as a *ranking* adjustment, not a *candidate set* adjustment. Built
+  this way in Phase 7 Module 1 (decision 21): a user's own recent-search
+  cache (client-side, `localStorage`, small) blends with the shared global
+  ranking at merge time in `SuggestionService`, rather than maintaining
+  separate tries — verified live, reordering a real tied-frequency result
+  based on a real client-submitted recent search.
 
 - **Q: What trade-offs exist between offline processing and real-time
   updates?**
@@ -813,12 +861,12 @@ build specifically (not left abstract).
 
 | Doc concept | Chapter | File(s) | Why this choice |
 |---|---|---|---|
-| Suggestion service | 3, 5 | `src/services/SuggestX.SuggestionService/` | `CurrentVersionPoller` polls ZooKeeper's `current_version` znode on a timer; `GET /suggestions?prefix=` (`SuggestionsController`) does one Redis `GET` against `trie:v{N}:{prefix}` via `RedisSuggestionReader`, with the decision-6 over-bound fallback (Phase 5 Module 1, decisions 16–17, verified live). SuggestionService is the first real reader of the ZooKeeper znode TrieBuilder writes. |
+| Suggestion service | 3, 5 | `src/services/SuggestX.SuggestionService/` | `CurrentVersionPoller` polls ZooKeeper's `current_version` znode on a timer; `GET /suggestions?prefix=` (`SuggestionsController`) does one Redis `GET` against `trie:v{N}:{prefix}` via `RedisSuggestionReader`, with the decision-6 over-bound fallback (Phase 5 Module 1, decisions 16–17, verified live). SuggestionService is the first real reader of the ZooKeeper znode TrieBuilder writes. An optional `recent` parameter reorders (never injects) within that same candidate set for personalization (Phase 7 Module 1, decision 21). |
 | Collection service | 5 | `src/services/SuggestX.CollectionService/` | `POST /search-events` validates and publishes to the `suggestx-search-events` Firehose delivery stream, awaiting durable acceptance before returning 202. Owns no store, holds no state. Phase 2, complete; the original in-memory buffer/flush-worker design was replaced by decision 11. |
 | Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | `RawLogPollingWorker` reads new `suggestx-raw-logs` objects on a timer via a sortable-key checkpoint, durably persisted in `suggestx-aggregator-checkpoints` (DynamoDB). `IPhraseFrequencyWriter` maps and reduces each batch's phrases into atomic `ADD`s against `suggestx-phrase-frequencies`, case-insensitive. Phase 3, complete (Modules 1–3). |
 | Trie builder | 5 | `src/services/SuggestX.TrieBuilder/` | `TrieBuildWorker` reads all of `suggestx-phrase-frequencies` on a timer and builds a fresh `CompressedTrie` (Phase 4 Module 1, verified against real branching data via `GET /_debug/search`), flattens it to `prefix → top-N` and publishes a new versioned namespace into Redis via `RedisFlattenedCachePublisher` (Phase 4 Module 2, decision 14), then persists that same content to S3 (`S3TrieSnapshotStore`) and flips a ZooKeeper `current_version` znode (`ZooKeeperVersionPublisher`) — only after Redis already has it live — so a restart recovers the last published version instead of resetting to 1 (Phase 4 Module 3, decision 15, verified across a real container restart). Phase 4 is now complete. |
 | Web servers / entry point | 3 | `src/services/SuggestX.Gateway/` | YARP proxy, four routes live: `/api/suggestions`, `/api/search-events` (Phase 1), plus `/api/aggregator` and `/api/trie-builder` (Phase 6 Module 3, decision 20 — debug-only, for the insights panel, both services' first caller-facing route of any kind). No auth layer, since the source doc has no identity concept at all. |
-| Client (the doc's implicit browser/app calling both APIs) | 2, 5 | `web/` | Hand-written Next.js 16 App Router app (not CLI-scaffolded — see decision 18), mirroring JameX's own `web/` conventions. `SearchBox` debounces input (`useDebouncedValue`, 300ms) and calls `GET /api/suggestions` through the Gateway (Module 1); submitting a search calls `POST /api/search-events` (Module 2, decision 19); `/insights` polls every service's `/_debug/status` plus TrieBuilder's new `/_debug/tree` every 2s and renders a real SVG graph of the live trie (Module 3, decision 20). All verified live in a real browser. |
+| Client (the doc's implicit browser/app calling both APIs) | 2, 5 | `web/` | Hand-written Next.js 16 App Router app (not CLI-scaffolded — see decision 18), mirroring JameX's own `web/` conventions. `SearchBox` debounces input (`useDebouncedValue`, 300ms) and calls `GET /api/suggestions` through the Gateway (Module 1); submitting a search calls `POST /api/search-events` and records it in a `localStorage` recent-search cache (Module 2, decision 19; the cache itself, Phase 7 Module 1, decision 21); `/insights` polls every service's `/_debug/status` plus TrieBuilder's new `/_debug/tree` every 2s and renders a real SVG graph of the live trie (Module 3, decision 20). All verified live in a real browser. |
 | HDFS | 4, 5 | `suggestx-raw-logs` (S3, LocalStack), written by the `suggestx-search-events` Firehose delivery stream, not directly by a service | `infra/localstack/init/01-bootstrap.sh`. See decision 3 (why S3) and decision 11 (why Firehose writes it instead of CollectionService). |
 | Cassandra | 4, 5 | `suggestx-phrase-frequencies` (DynamoDB, LocalStack) | Same script. See decision 3. |
 | MongoDB (trie doc store) | 5 | `suggestx-trie-snapshots` (S3, LocalStack) | Same script. See decision 3 — S3, not a document store, deliberately. |
@@ -839,4 +887,4 @@ build specifically (not left abstract).
 | Suggestion service (Redis-backed) | ✅ Built and verified (Phase 5 Module 1) |
 | Client-side optimization — debounce | ✅ Built and verified (Phase 6 Module 1) |
 | Client-side optimizations — input threshold, local cache, early connection, edge cache | ⬜ Designed, not built |
-| Personalization | ⬜ Designed, not built |
+| Personalization | ✅ Built and verified (Phase 7 Module 1) |

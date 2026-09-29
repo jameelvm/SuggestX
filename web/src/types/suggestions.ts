@@ -12,4 +12,6 @@ export interface SuggestionItem {
 export interface SuggestionResponse {
   prefix: string;
   suggestions: SuggestionItem[];
+  /** Which phrases in `suggestions` were reordered ahead of their global ranking because they matched the caller's own recent-search list (Phase 7 personalization). */
+  personalizedPhrases: string[];
 }

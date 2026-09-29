@@ -6,6 +6,7 @@ import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import { ApiError } from "@/lib/api/browser-client";
 import { submitSearchEvent } from "@/lib/api/search-events";
 import { fetchSuggestions } from "@/lib/api/suggestions";
+import { recordRecentSearch } from "@/lib/recent-searches";
 import type { SuggestionItem } from "@/types/suggestions";
 
 const DEBOUNCE_MS = 300;
@@ -27,10 +28,20 @@ const DEBOUNCE_MS = 300;
  * distinction CollectionService's own controller comment already draws
  * ("fired once a search is actually submitted... not per keystroke").
  * </para>
+ * <para>
+ * Module 3 / Phase 7 (this addition): a successful submission is also
+ * recorded in this browser's own small recent-search list
+ * (`recordRecentSearch`), which every subsequent suggestions fetch sends
+ * back to `SuggestionService` for personalization — reordering, never
+ * inventing new candidates (DESIGN.md's personalization Q&A). Entries the
+ * server reports as personalized get a small "recent" badge so the effect
+ * is actually visible, not just present in the response JSON.
+ * </para>
  */
 export function SearchBox() {
   const [query, setQuery] = useState("");
   const [suggestions, setSuggestions] = useState<SuggestionItem[]>([]);
+  const [personalizedPhrases, setPersonalizedPhrases] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [submittedNote, setSubmittedNote] = useState<string | null>(null);
   const debouncedQuery = useDebouncedValue(query, DEBOUNCE_MS);
@@ -57,11 +68,13 @@ export function SearchBox() {
       .then((response) => {
         if (requestId !== latestRequestId.current) return;
         setSuggestions(response.suggestions);
+        setPersonalizedPhrases(new Set(response.personalizedPhrases));
         setError(null);
       })
       .catch((err: unknown) => {
         if (requestId !== latestRequestId.current) return;
         setSuggestions([]);
+        setPersonalizedPhrases(new Set());
         setError(
           err instanceof ApiError
             ? `Suggestions unavailable (${err.status})`
@@ -78,7 +91,10 @@ export function SearchBox() {
     if (trimmed.length === 0) return;
 
     submitSearchEvent(trimmed)
-      .then(() => setSubmittedNote(`Logged "${trimmed}" — watch it flow through the pipeline`))
+      .then(() => {
+        setSubmittedNote(`Logged "${trimmed}" — watch it flow through the pipeline`);
+        recordRecentSearch(trimmed);
+      })
       .catch(() => setSubmittedNote(null));
   }
 
@@ -121,7 +137,14 @@ export function SearchBox() {
                 onClick={() => handleSuggestionClick(item.phrase)}
                 className="flex w-full items-center justify-between px-5 py-2.5 text-left text-sm text-neutral-800 hover:bg-neutral-50"
               >
-                <span>{item.phrase}</span>
+                <span className="flex items-center gap-2">
+                  {item.phrase}
+                  {personalizedPhrases.has(item.phrase) && (
+                    <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                      recent
+                    </span>
+                  )}
+                </span>
                 <span className="text-neutral-400">{item.frequency}</span>
               </button>
             </li>

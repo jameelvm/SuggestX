@@ -6,6 +6,9 @@ using SuggestX.SuggestionService.Configuration;
 
 namespace SuggestX.SuggestionService.Services;
 
+/// <summary>Ranked matches for a prefix, plus which of them were reordered by personalization — see <see cref="SuggestionResponse.PersonalizedPhrases"/>.</summary>
+public sealed record SuggestionMatchResult(IReadOnlyList<SuggestionItem> Items, IReadOnlyList<string> PersonalizedPhrases);
+
 /// <summary>
 /// The doc's "suggestion service retrieves the top ten from the Redis
 /// cache," taken literally (decision 2): one <see cref="StringGetAsync"/>
@@ -16,7 +19,8 @@ namespace SuggestX.SuggestionService.Services;
 /// </summary>
 public interface ISuggestionReader
 {
-    Task<IReadOnlyList<SuggestionItem>> GetTopMatchesAsync(string rawPrefix, int limit, CancellationToken ct);
+    Task<SuggestionMatchResult> GetTopMatchesAsync(
+        string rawPrefix, int limit, IReadOnlyList<string> recentPhrases, CancellationToken ct);
 }
 
 public sealed class RedisSuggestionReader(
@@ -25,7 +29,8 @@ public sealed class RedisSuggestionReader(
     IOptions<SuggestionServiceOptions> options,
     ILogger<RedisSuggestionReader> logger) : ISuggestionReader
 {
-    public async Task<IReadOnlyList<SuggestionItem>> GetTopMatchesAsync(string rawPrefix, int limit, CancellationToken ct)
+    public async Task<SuggestionMatchResult> GetTopMatchesAsync(
+        string rawPrefix, int limit, IReadOnlyList<string> recentPhrases, CancellationToken ct)
     {
         // Same normalization as Aggregator's DynamoPhraseFrequencyWriter —
         // enforced in exactly one place there because every downstream
@@ -34,7 +39,7 @@ public sealed class RedisSuggestionReader(
         // so a request has to be lower-cased identically to land on the
         // same Redis key.
         var normalized = rawPrefix.Trim().ToLowerInvariant();
-        if (normalized.Length == 0 || limit <= 0) return [];
+        if (normalized.Length == 0 || limit <= 0) return new([], []);
 
         if (currentVersion.Version is not { } version)
         {
@@ -42,28 +47,60 @@ public sealed class RedisSuggestionReader(
             // error. Matches TrieBuilder's own /_debug/search "no trie
             // built yet" framing for the same underlying situation.
             logger.LogDebug("No trie version known yet; returning no suggestions for {Prefix}", normalized);
-            return [];
+            return new([], []);
         }
 
         var maxLength = options.Value.MaxPrefixLength;
+        List<SuggestionItem> candidates;
         if (normalized.Length <= maxLength)
         {
-            var matches = await FetchAsync(version, normalized);
-            return matches.Take(limit).ToList();
+            candidates = await FetchAsync(version, normalized);
+        }
+        else
+        {
+            // Decision 6's degradation: beyond the bound TrieBuilder actually
+            // precomputed, fall back to the longest prefix it did flatten,
+            // then filter down to phrases that still genuinely match
+            // everything the user typed. A real degradation — a phrase that
+            // would rank in the true top-N for the full prefix but fell
+            // outside this shorter prefix's own top-N is missed — not a
+            // silently wrong answer.
+            var truncated = normalized[..maxLength];
+            var all = await FetchAsync(version, truncated);
+            candidates = all.Where(c => c.Phrase.StartsWith(normalized, StringComparison.Ordinal)).ToList();
         }
 
-        // Decision 6's degradation: beyond the bound TrieBuilder actually
-        // precomputed, fall back to the longest prefix it did flatten, then
-        // filter down to phrases that still genuinely match everything the
-        // user typed. A real degradation — a phrase that would rank in the
-        // true top-N for the full prefix but fell outside this shorter
-        // prefix's own top-N is missed — not a silently wrong answer.
-        var truncated = normalized[..maxLength];
-        var candidates = await FetchAsync(version, truncated);
-        return candidates
-            .Where(c => c.Phrase.StartsWith(normalized, StringComparison.Ordinal))
-            .Take(limit)
+        // Personalization reorders within `candidates` only — it can never
+        // surface a phrase the flattened cache didn't already return, since
+        // that would mean querying DynamoDB by exact phrase, which
+        // SuggestionService deliberately never touches (decision 2). The
+        // full candidate set (up to TrieBuilder's own TopN) is considered
+        // here, not just the first `limit` of it, so a personally-recent
+        // phrase ranked just outside the requested limit can still be
+        // promoted into view.
+        return Personalize(candidates, recentPhrases, limit);
+    }
+
+    private static SuggestionMatchResult Personalize(
+        List<SuggestionItem> candidates, IReadOnlyList<string> recentPhrases, int limit)
+    {
+        var recentSet = recentPhrases
+            .Select(p => p.Trim().ToLowerInvariant())
+            .Where(p => p.Length > 0)
+            .ToHashSet();
+
+        if (recentSet.Count == 0) return new(candidates.Take(limit).ToList(), []);
+
+        var boosted = candidates.Where(c => recentSet.Contains(c.Phrase.ToLowerInvariant()));
+        var rest = candidates.Where(c => !recentSet.Contains(c.Phrase.ToLowerInvariant()));
+        var merged = boosted.Concat(rest).Take(limit).ToList();
+
+        var personalizedPhrases = merged
+            .Where(m => recentSet.Contains(m.Phrase.ToLowerInvariant()))
+            .Select(m => m.Phrase)
             .ToList();
+
+        return new(merged, personalizedPhrases);
     }
 
     private async Task<List<SuggestionItem>> FetchAsync(int version, string prefix)
