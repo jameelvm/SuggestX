@@ -6,9 +6,12 @@ Say this to Claude at the start of the next session:
 
 > Read PROGRESS.md and CLAUDE.md in C:\System Design\TypeheadSuggestion\App,
 > then continue Phase 7 — evaluation extras. Modules 1-2 (personalization,
-> remaining client-side optimizations + edge-cache headers) are done and
-> verified live; next is fault-tolerance verification. Build in short
-> modules, pausing after each one so I can review before you continue.
+> remaining client-side optimizations + edge-cache headers) are done;
+> Module 3 (fault-tolerance verification) is in progress — TrieBuilder
+> crash mid-build is done and found a real gap (decision 23); remaining
+> scenarios are stopping Redis, killing SuggestionService, and stopping
+> LocalStack mid-request. Build in short modules, pausing after each one
+> so I can review before you continue.
 
 **Build in short modules.** One concept per module, verified and explained
 before moving on — same discipline as JameX.
@@ -91,8 +94,14 @@ Module 2 (remaining client-side optimizations + a real edge-cache
 header) complete, verified live — including root-causing a real
 verification confusion (React Strict Mode's dev-only double-effect
 firing two near-simultaneous fetches) down to a clean proof against a
-real production build rather than dismissing it. Fault-tolerance
-verification next.**
+real production build rather than dismissing it. Module 3
+(fault-tolerance verification) in progress — TrieBuilder crash mid-build
+tested with a real, precisely-timed `docker kill`, found a genuine gap
+(decision 23: a crash landing between a successful Redis publish and the
+ZooKeeper flip leaves ZooKeeper pointing at deleted data, causing real
+empty results, not stale ones), confirmed self-healing on restart.
+Remaining scenarios: stopping Redis, killing SuggestionService, stopping
+LocalStack mid-request.**
 **Local debugging (cross-cutting, not a phase) — set up and verified.**
 Every service can now run under the Visual Studio debugger, on the exact
 port its container publishes, with the Gateway automatically reaching
@@ -988,19 +997,101 @@ correct, not an oversight.
       build` and `npx eslint .` both pass clean; the .NET solution
       builds clean.
 
+- [x] **Phase 7 Module 3 (fault-tolerance verification, part 1) —
+      TrieBuilder crashing mid-build.** First established this wasn't
+      one risk but two, by reading `TrieBuildWorker.BuildAsync`'s actual
+      ordering closely: the Redis publish (new keys written, old keys
+      deleted) completes entirely before the ZooKeeper flip even starts.
+      A crash *before* the Redis publish is exactly what decision 8's
+      blue/green ordering protects against. A crash *after* the Redis
+      publish succeeds but *before* the ZooKeeper flip is a different,
+      untested story — the old version's Redis keys are already gone,
+      but ZooKeeper hasn't been told the new version exists yet.
+
+      Verified the second, riskier case with a real, precisely-timed
+      crash — not a thought experiment. Temporarily inserted a 15s delay
+      right at that exact boundary (removed afterward), rebuilt and
+      redeployed TrieBuilder, polled its own container logs to detect
+      the delay's log line the instant it appeared, and fired a real
+      `docker kill` (SIGKILL, no graceful shutdown) right then.
+
+      **Result, captured immediately after the kill:** `zkCli.sh get`
+      showed ZooKeeper frozen at the old version; `redis-cli KEYS`
+      showed *only* the new version's keys (the old ones already
+      deleted); and a real `GET /suggestions?prefix=guitar` — a query
+      that has returned correct results throughout this entire
+      project — came back with a completely empty suggestion list. Not
+      stale. Not an error. Silently, completely empty, for a query with
+      genuine matches. This is the same shape of gap as decision 17 (a
+      stale ZooKeeper pointer outliving the Redis data it points to),
+      just triggered by a crash instead of an outage — found and
+      reproduced live, not merely theorized, and the failure-mode
+      table's prior "crash mid-build leaves the previously-served
+      version untouched" wording has been split into two accurate rows
+      to reflect it.
+
+      **Self-healing confirmed too:** restarting TrieBuilder correctly
+      recovered the frozen old version from ZooKeeper, reloaded that
+      version's known prefixes from its S3 snapshot, and republished
+      forward — no duplicate version numbers, no confusion, no manual
+      intervention beyond the restart. Once the next cycle's ZooKeeper
+      flip completed, real queries returned correct results again.
+
+      Cleaned up rigorously, not just "looks fine": removed the
+      temporary delay, rebuilt, redeployed, and confirmed via `git diff`
+      producing zero output that the file is byte-identical to what was
+      already committed — not just visually similar. A final live check
+      confirmed normal, fast build cycles and correct query results
+      resumed immediately.
+
+- [x] **Post-Phase-6 addition (not a numbered module — Phase 6 was already
+      marked complete; recorded honestly as a later addition, not folded
+      silently into that phase's history) — a live phrase-frequency
+      table.** User request: a real UI table over
+      `suggestx-phrase-frequencies`, Aggregator's own DynamoDB table.
+
+      Aggregator gained its first read access to a table it otherwise
+      only ever writes: `DynamoPhraseFrequencySnapshotReader` (a full
+      `Scan`, the same shape and the same null-vs-empty defensiveness as
+      TrieBuilder's own reader for the same table) backs a new `GET
+      /_debug/frequencies` endpoint, ranked by frequency then phrase.
+      Reachable at `/api/aggregator/_debug/frequencies` with no new
+      Gateway config at all — that route already existed from Phase 6
+      Module 3. `web/src/app/frequencies/page.tsx` polls it every 2s
+      (the same `usePolling`/`useNow` pair as `/insights`) and renders
+      it through a new `FrequencyTable` component: sortable columns
+      (click "Phrase" or "Frequency" to sort, click again to reverse)
+      and a client-side substring filter, both over the already-fetched
+      rows — no new server-side search/sort endpoint, the same
+      toy-scale simplification this project already applies elsewhere.
+      Added to the site nav as "Frequencies."
+
+      **Verified live in a real browser:** real data rendered correctly,
+      sorted by frequency descending by default; clicking "Phrase"
+      re-sorted alphabetically; typing "guitar" into the filter
+      correctly narrowed to exactly the 3 matching rows while keeping
+      them sorted. Then the real end-to-end proof: submitted a genuinely
+      new phrase ("ukulele strumming") on the search page, watched it
+      land in S3 then get applied to DynamoDB via the real container
+      logs, and — without ever touching or reloading the already-open
+      `/frequencies` tab — its own 2s poll picked it up on its own,
+      moving the row count from 18 to 19 and rendering the new phrase
+      at frequency 1. Zero console errors. `npm run build` and `npx
+      eslint .` both pass clean; the .NET solution builds clean.
+
 ### In progress
 
-Nothing — Phase 7 Module 2 (remaining client-side optimizations +
-edge-cache headers) verified live, including root-causing and resolving
-a real dev-mode-only verification confusion (React Strict Mode's
-double-effect-invocation) rather than papering over it.
+Nothing — Phase 7 Module 3's first scenario (TrieBuilder crash
+mid-build) verified live with a real, precisely-timed crash, self-healing
+confirmed, and the environment cleanly restored to normal afterward. The
+phrase-frequencies table (a post-Phase-6 addition) is also verified live.
 
 ### Next up (immediate)
 
-**Phase 7 — Evaluation extras**, continued: fault-tolerance verification
-(deliberately killing ZooKeeper/Redis/TrieBuilder mid-cycle and
-confirming the failure-mode table's mitigations — and its one corrected,
-not-fully-mitigated row, decision 17 — actually hold as documented).
+**Phase 7 — Evaluation extras**, continued: the remaining fault-tolerance
+scenarios — stopping Redis entirely, killing SuggestionService and
+confirming cold-start recovery, and stopping LocalStack while
+CollectionService is accepting a request.
 
 ---
 

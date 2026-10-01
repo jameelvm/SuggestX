@@ -15,6 +15,7 @@ public static class AggregatorServiceCollectionExtensions
         services.AddSingleton<IAggregatorStats, AggregatorStats>();
         services.AddSingleton<IRawLogReader, S3RawLogReader>();
         services.AddSingleton<IPhraseFrequencyWriter, DynamoPhraseFrequencyWriter>();
+        services.AddSingleton<IPhraseFrequencySnapshotReader, DynamoPhraseFrequencySnapshotReader>();
         services.AddHostedService<RawLogPollingWorker>();
         return services;
     }

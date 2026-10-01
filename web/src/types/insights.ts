@@ -43,3 +43,15 @@ export interface TrieTreeResponse {
   built: boolean;
   root: TrieTreeNode | null;
 }
+
+/** One row of `suggestx-phrase-frequencies`, as `AggregatorDebugController.Frequencies` already ranks it. */
+export interface PhraseFrequencyRow {
+  phrase: string;
+  frequency: number;
+}
+
+/** Mirrors `AggregatorDebugController.Frequencies`. */
+export interface PhraseFrequenciesResponse {
+  count: number;
+  entries: PhraseFrequencyRow[];
+}

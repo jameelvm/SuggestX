@@ -2,6 +2,7 @@ import { browserApiFetch } from "@/lib/api/browser-client";
 import type {
   AggregatorStatus,
   CollectionStatus,
+  PhraseFrequenciesResponse,
   SuggestionServiceStatus,
   TrieBuilderStatus,
   TrieTreeResponse,
@@ -34,4 +35,8 @@ export function fetchSuggestionServiceStatus(): Promise<SuggestionServiceStatus>
 
 export function fetchTrieTree(): Promise<TrieTreeResponse> {
   return browserApiFetch<TrieTreeResponse>("/trie-builder/_debug/tree");
+}
+
+export function fetchPhraseFrequencies(): Promise<PhraseFrequenciesResponse> {
+  return browserApiFetch<PhraseFrequenciesResponse>("/aggregator/_debug/frequencies");
 }

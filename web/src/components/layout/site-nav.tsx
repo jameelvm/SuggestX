@@ -9,6 +9,9 @@ export function SiteNav() {
       <Link href="/insights" className="text-sm font-medium text-neutral-600 hover:text-neutral-900">
         Insights
       </Link>
+      <Link href="/frequencies" className="text-sm font-medium text-neutral-600 hover:text-neutral-900">
+        Frequencies
+      </Link>
     </nav>
   );
 }

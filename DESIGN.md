@@ -719,11 +719,99 @@ considered, and why this one won.
     production server for this specific verification) was restarted and
     re-confirmed working before moving on.
 
+23. **Phase 7's fault-tolerance verification: "TrieBuilder crashes
+    mid-build" is not one risk, it's two, with very different
+    outcomes — and only one of them is actually mitigated.** Reading
+    `TrieBuildWorker.BuildAsync` closely shows the real ordering:
+    `cachePublisher.PublishAsync` (writes the new version's Redis keys
+    *and* deletes the old version's) completes entirely before
+    `versionPublisher.PublishCurrentVersionAsync` (the ZooKeeper flip)
+    even starts. A crash *before* the Redis publish is exactly what
+    decision 8's blue/green ordering protects against — ZooKeeper still
+    points at the old, fully-intact version. A crash *after* the Redis
+    publish succeeds but *before* the ZooKeeper flip is a different
+    story: the old version's Redis keys are already gone by that point,
+    but ZooKeeper hasn't been told the new version exists yet — it's
+    still confidently pointing callers at a version whose keys no longer
+    exist. The exact same shape of gap as decision 17 (a stale ZooKeeper
+    pointer outliving the Redis data it points to), just triggered by a
+    process crash instead of a ZooKeeper outage.
+
+    **Verified live with a real, precisely-timed crash, not a thought
+    experiment.** A temporary delay was added right at that exact
+    boundary — after the Redis publish, before the S3 snapshot/ZooKeeper
+    flip — specifically to widen a gap that normally closes in well
+    under a second into a reliable several-second window to kill the
+    process in. `docker kill` (a real SIGKILL, no graceful shutdown) was
+    fired the instant the delay's log line appeared, confirmed by
+    polling the container's own logs rather than guessing at timing.
+    Immediately afterward: `zkCli.sh get` showed ZooKeeper frozen at the
+    old version; `redis-cli KEYS` showed *only* the new version's keys
+    (the old ones already deleted); and a real `guitar` search — a query
+    that has returned correct results throughout this entire project —
+    came back with an empty suggestion list. Not stale. Not an error.
+    Silently, completely empty, for a query with genuine matches.
+
+    Restarting `TrieBuilder` proved the self-healing side of the claim
+    true: it correctly recovered the frozen old version from ZooKeeper,
+    reloaded that version's known prefixes from its S3 snapshot (Module
+    3), and republished forward from there — no duplicate version
+    numbers, no confusion, no manual intervention beyond the restart
+    itself. Once the next cycle's ZooKeeper flip completed, real queries
+    started returning correct results again. The temporary delay was
+    then removed entirely — confirmed via `git diff` producing no
+    output, i.e. the file is byte-identical to what was already
+    committed, not just "looks the same."
+
+    **Not fixed here, deliberately — the same tradeoff as decision 17's
+    own gap, not a new kind of risk being introduced:** self-healing
+    within one build cycle, no permanent corruption, but a real window
+    where correct queries return incorrectly empty results. The two
+    candidate fixes already named for decision 17 apply identically
+    here (pause the Redis cleanup step until the ZooKeeper flip is
+    confirmed, or give `SuggestionService` a way to distinguish "should
+    have data" from a genuine no-match) — recorded as the same open
+    question, not duplicated as a separate one.
+
+24. **A live phrase-frequency table, added after Phase 6 was already
+    marked complete — recorded honestly as a later addition, not folded
+    silently into that phase's own history.** Aggregator gained its
+    first read access to `suggestx-phrase-frequencies`, a table it
+    otherwise only ever writes: `DynamoPhraseFrequencySnapshotReader`, a
+    full `Scan` mirroring TrieBuilder's own reader for the same table
+    almost exactly (same null-vs-empty defensiveness, same "toy-scale
+    simplification, not a bounded query" reasoning), behind a new `GET
+    /_debug/frequencies` endpoint. Reachable at
+    `/api/aggregator/_debug/frequencies` with zero new Gateway
+    configuration — that route already existed from Phase 6 Module 3,
+    added for the insights panel's own Aggregator status polling.
+
+    The frontend piece (`web/src/app/frequencies/page.tsx`,
+    `FrequencyTable`) deliberately reuses rather than reinvents: the
+    same `usePolling`/`useNow` pair the insights panel already
+    established, sorting and filtering done entirely client-side over
+    the already-fetched rows rather than a new server-side search/sort
+    endpoint — this project's data is a few dozen phrases at demo
+    scale, and a real search API for that would be exactly the
+    unnecessary abstraction this project's own conventions warn
+    against.
+
+    **Verified live, including the real end-to-end proof this project
+    always insists on over a static snapshot:** sortable columns and
+    the substring filter confirmed correct in a real browser. Then,
+    without touching or reloading an already-open `/frequencies` tab,
+    submitted a genuinely new phrase on the search page in a second tab
+    and watched the first tab's own 2s poll pick it up on its own —
+    row count 18 → 19, the new phrase rendering at frequency 1 — the
+    same "two tabs, one driving, one only ever polling" verification
+    shape already established for the insights panel (decision 20).
+
 ## §2 Failure-mode table
 
 | Failure | Effect without mitigation | Mitigation in this build |
 |---|---|---|
-| `TrieBuilder` crashes mid-build | Partial/corrupt version could be served | Blue/green swap (decision 8): the ZooKeeper pointer only flips after the full new version is written and validated, so a crash mid-build leaves the previously-served version untouched. |
+| `TrieBuilder` crashes before finishing its Redis publish | Partial/corrupt version could be served | Mitigated: the old version's Redis keys are only deleted after every new key is written, so a crash here leaves the previous version's keys, and ZooKeeper's pointer to them, completely untouched. Verified live via a precisely-timed kill. |
+| `TrieBuilder` crashes after its Redis publish succeeds but before the ZooKeeper flip | The previous version's Redis keys are already gone (deleted as part of the same publish that wrote the new ones) but ZooKeeper still points at that now-nonexistent version | Not mitigated — found and reproduced live with a deliberate, precisely-timed crash (decision 23), not just theorized. Self-heals on restart (TrieBuilder resumes from ZooKeeper's still-old version and republishes forward), but real queries during the window return empty results, not stale ones — the same shape of gap as decision 17, with a different trigger. |
 | `TrieBuilder` restarts | Its version counter and previous-prefix-set could reset, overwriting `trie:v1:*` again and orphaning the prior version's keys forever | Mitigated (Module 3, decision 15): startup reads the ZooKeeper `current_version` znode and reloads that version's S3 snapshot, resuming the counter and previous-prefix-set instead of resetting them. Verified live across a real container restart. |
 | Aggregator falls behind (batch job takes longer than its own interval) | Frequencies grow stale, or two runs overlap and double-count | Aggregator checkpoints its S3 read offset per run; a run that overlaps the next start is a documented open question (see §4) rather than silently assumed away. |
 | Aggregator crashes between a successful frequency `ADD` and its checkpoint's durable write | A restart re-reads and re-counts that one batch, over-counting it | Not mitigated — accepted as a rare, self-bounded (at most one batch) overcount rather than adding an idempotency guard or a cross-table transaction. See decision 13. |
@@ -901,12 +989,15 @@ build specifically (not left abstract).
   project whose point is demonstrating the pipeline shape, not
   operating it at production data volume. See §3's Q&A entry on this for
   the production-design options actually considered.
-- **A sustained ZooKeeper outage lets TrieBuilder's Redis cleanup delete
-  the exact version SuggestionService is still frozen on** — decision 17,
-  found and reproduced live, not theorized. Self-heals once ZooKeeper
-  recovers; not closed here. Two candidate fixes (pause TrieBuilder's
-  cleanup during an outage, or have SuggestionService distinguish a
-  "should have data" empty read from a genuine no-match) are named in
+- **A stale ZooKeeper `current_version` pointer can outlive the Redis
+  data it points to, from two different real triggers** — a sustained
+  ZooKeeper outage (decision 17) or a TrieBuilder crash landing in the
+  gap between its Redis publish succeeding and its ZooKeeper flip
+  (decision 23) — both found and reproduced live, not theorized. Both
+  self-heal within one cycle; neither closed here. Two candidate fixes
+  (pause TrieBuilder's Redis cleanup until the flip is confirmed, or
+  have SuggestionService distinguish a "should have data" empty read
+  from a genuine no-match) apply identically to both triggers, named in
   decision 17, neither implemented.
 - **`SuggestionServiceOptions.MaxPrefixLength` must be kept manually in
   sync with `TrieBuilder:MaxPrefixLength`** — decision 16. Two
@@ -920,10 +1011,10 @@ build specifically (not left abstract).
 |---|---|---|---|
 | Suggestion service | 3, 5 | `src/services/SuggestX.SuggestionService/` | `CurrentVersionPoller` polls ZooKeeper's `current_version` znode on a timer; `GET /suggestions?prefix=` (`SuggestionsController`) does one Redis `GET` against `trie:v{N}:{prefix}` via `RedisSuggestionReader`, with the decision-6 over-bound fallback (Phase 5 Module 1, decisions 16–17, verified live). SuggestionService is the first real reader of the ZooKeeper znode TrieBuilder writes. An optional `recent` parameter reorders (never injects) within that same candidate set for personalization (Phase 7 Module 1, decision 21). Every response also carries `Cache-Control: public, max-age=5` (Phase 7 Module 2, decision 22). |
 | Collection service | 5 | `src/services/SuggestX.CollectionService/` | `POST /search-events` validates and publishes to the `suggestx-search-events` Firehose delivery stream, awaiting durable acceptance before returning 202. Owns no store, holds no state. Phase 2, complete; the original in-memory buffer/flush-worker design was replaced by decision 11. |
-| Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | `RawLogPollingWorker` reads new `suggestx-raw-logs` objects on a timer via a sortable-key checkpoint, durably persisted in `suggestx-aggregator-checkpoints` (DynamoDB). `IPhraseFrequencyWriter` maps and reduces each batch's phrases into atomic `ADD`s against `suggestx-phrase-frequencies`, case-insensitive. Phase 3, complete (Modules 1–3). |
+| Aggregator (MapReduce over HDFS) | 4, 5 | `src/services/SuggestX.Aggregator/` | `RawLogPollingWorker` reads new `suggestx-raw-logs` objects on a timer via a sortable-key checkpoint, durably persisted in `suggestx-aggregator-checkpoints` (DynamoDB). `IPhraseFrequencyWriter` maps and reduces each batch's phrases into atomic `ADD`s against `suggestx-phrase-frequencies`, case-insensitive. Phase 3, complete (Modules 1–3). `GET /_debug/frequencies` (`DynamoPhraseFrequencySnapshotReader`) gives Aggregator its first read access to that same table, for the frontend's live frequency table (decision 24). |
 | Trie builder | 5 | `src/services/SuggestX.TrieBuilder/` | `TrieBuildWorker` reads all of `suggestx-phrase-frequencies` on a timer and builds a fresh `CompressedTrie` (Phase 4 Module 1, verified against real branching data via `GET /_debug/search`), flattens it to `prefix → top-N` and publishes a new versioned namespace into Redis via `RedisFlattenedCachePublisher` (Phase 4 Module 2, decision 14), then persists that same content to S3 (`S3TrieSnapshotStore`) and flips a ZooKeeper `current_version` znode (`ZooKeeperVersionPublisher`) — only after Redis already has it live — so a restart recovers the last published version instead of resetting to 1 (Phase 4 Module 3, decision 15, verified across a real container restart). Phase 4 is now complete. |
 | Web servers / entry point | 3 | `src/services/SuggestX.Gateway/` | YARP proxy, four routes live: `/api/suggestions`, `/api/search-events` (Phase 1), plus `/api/aggregator` and `/api/trie-builder` (Phase 6 Module 3, decision 20 — debug-only, for the insights panel, both services' first caller-facing route of any kind). No auth layer, since the source doc has no identity concept at all. |
-| Client (the doc's implicit browser/app calling both APIs) | 2, 5 | `web/` | Hand-written Next.js 16 App Router app (not CLI-scaffolded — see decision 18), mirroring JameX's own `web/` conventions. `SearchBox` debounces input (`useDebouncedValue`, 300ms) and enforces a minimum query length before fetching (Module 1; the input threshold, Phase 7 Module 2, decision 22) and calls `GET /api/suggestions` through the Gateway; submitting a search calls `POST /api/search-events` and records it in a `localStorage` recent-search cache (Module 2, decision 19; the cache itself, Phase 7 Module 1, decision 21); `/insights` polls every service's `/_debug/status` plus TrieBuilder's new `/_debug/tree` every 2s and renders a real SVG graph of the live trie (Module 3, decision 20). `fetchSuggestions` also holds a short-TTL local response cache and `RootLayout` preconnects to the Gateway's origin (Phase 7 Module 2, decision 22). All verified live in a real browser. |
+| Client (the doc's implicit browser/app calling both APIs) | 2, 5 | `web/` | Hand-written Next.js 16 App Router app (not CLI-scaffolded — see decision 18), mirroring JameX's own `web/` conventions. `SearchBox` debounces input (`useDebouncedValue`, 300ms) and enforces a minimum query length before fetching (Module 1; the input threshold, Phase 7 Module 2, decision 22) and calls `GET /api/suggestions` through the Gateway; submitting a search calls `POST /api/search-events` and records it in a `localStorage` recent-search cache (Module 2, decision 19; the cache itself, Phase 7 Module 1, decision 21); `/insights` polls every service's `/_debug/status` plus TrieBuilder's new `/_debug/tree` every 2s and renders a real SVG graph of the live trie (Module 3, decision 20). `fetchSuggestions` also holds a short-TTL local response cache and `RootLayout` preconnects to the Gateway's origin (Phase 7 Module 2, decision 22). `/frequencies` polls Aggregator's own table and renders it as a real sortable, filterable table (decision 24). All verified live in a real browser. |
 | HDFS | 4, 5 | `suggestx-raw-logs` (S3, LocalStack), written by the `suggestx-search-events` Firehose delivery stream, not directly by a service | `infra/localstack/init/01-bootstrap.sh`. See decision 3 (why S3) and decision 11 (why Firehose writes it instead of CollectionService). |
 | Cassandra | 4, 5 | `suggestx-phrase-frequencies` (DynamoDB, LocalStack) | Same script. See decision 3. |
 | MongoDB (trie doc store) | 5 | `suggestx-trie-snapshots` (S3, LocalStack) | Same script. See decision 3 — S3, not a document store, deliberately. |
