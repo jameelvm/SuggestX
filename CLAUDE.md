@@ -7,6 +7,8 @@ has a real, runnable counterpart here.
 
 ## Read this first
 
+- **`RUNNING.md`** — how to run the full stack locally, from a clean
+  machine (prerequisites, env setup, Docker Compose, frontend).
 - **`PROGRESS.md`** — live build state. What is done, what is next, where the
   last session stopped. **Update it at the end of every working session.**
 - **`README.md`** — end-to-end teaching documentation. **Update it at the end of
@@ -137,6 +139,7 @@ else lives inside this folder:
 ```
 App/
 ├── CLAUDE.md             # this file
+├── RUNNING.md            # how to run the full stack locally
 ├── PROGRESS.md           # session state — read and update every session
 ├── README.md             # end-to-end teaching docs, updated every phase
 ├── DESIGN.md             # decision register, failure-mode table, Q&A bank

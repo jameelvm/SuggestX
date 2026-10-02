@@ -1,12 +1,23 @@
 # SuggestX
 
-A working typeahead/autocomplete system, built end to end to internalise the
-"Typeahead Suggestion System" design chapters in `../*.pdf`. This document is
-revision material — it explains what was built,
-why, and how to see it working — updated at the end of every phase, not a
-running change log. For the decision-by-decision reasoning and the
-failure-mode/Q&A material, see `DESIGN.md`. For live build state, see
-`PROGRESS.md`.
+SuggestX is a typeahead/autocomplete system: type a few letters into a
+search box, get fast, ranked suggestions back — the same experience behind
+Google Search, e-commerce product search, and code editor autocomplete. It's
+built as a real, working system end to end, not a mockup: a write path that
+logs and aggregates what people search for, and a read path that answers
+every keystroke from a precomputed cache kept in sync by that pipeline
+running behind it.
+
+This document is revision material — it explains what was built, why, and
+how to see it working — updated at the end of every phase, not a running
+change log.
+
+- **[RUNNING.md](RUNNING.md)** — how to run the full stack locally
+- **[DESIGN.md](DESIGN.md)** — decision-by-decision reasoning, the
+  failure-mode table, and the Q&A bank
+- **[DEBUGGING.md](DEBUGGING.md)** — running a service under the debugger
+  alongside the rest of the stack in Docker
+- **[PROGRESS.md](PROGRESS.md)** — live build state
 
 ## What is a typeahead suggestion system?
 
