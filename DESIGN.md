@@ -6,13 +6,6 @@ choice, every failure mode it was built to survive, and the questions the
 design doc itself poses (each chapter ends with one or more "show answer"
 prompts — answered here, against this build, not abstractly).
 
-## §0 Source material
-
-`../*.pdf` — the "Typeahead Suggestion System" design chapters, six in total:
-overview, requirements, high-level design, data structure (trie), detailed
-design (suggestion service + assembler), evaluation. Read in full
-2026-09-17 before any scaffolding was written.
-
 ## Architecture overview
 
 A diagram-first pass through the system, for anyone who wants the shape of
