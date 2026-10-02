@@ -13,6 +13,165 @@ overview, requirements, high-level design, data structure (trie), detailed
 design (suggestion service + assembler), evaluation. Read in full
 2026-09-17 before any scaffolding was written.
 
+## Architecture overview
+
+A diagram-first pass through the system, for anyone who wants the shape of
+it before the decision-by-decision reasoning in §1. Everything below is
+restated, in prose, from the five services' actual code and the stores they
+actually touch — not an idealized version of the design.
+
+### The rule everything else follows
+
+**No service ever calls another service's API as part of the pipeline.**
+The only service-to-service HTTP calls in this system are the Gateway
+proxying a client's own request to exactly one backend. Every handoff
+*between* pipeline stages — Collection → Aggregator → TrieBuilder →
+SuggestionService — happens by one stage writing to a store and the next
+stage polling that same store on its own timer. This is why there's no
+message queue, no internal REST calls, and no shared "orchestrator": the
+stores themselves (S3, DynamoDB, Redis, ZooKeeper) *are* the integration
+layer. See decision 1 for why that's possible at all (nothing here is
+relational), and decision 2 for why the read path specifically never joins
+that pipeline.
+
+### Component diagram
+
+```mermaid
+flowchart LR
+    subgraph Browser
+        Web["web/ (Next.js)"]
+    end
+
+    Web -->|"GET /api/suggestions\nPOST /api/search-events"| GW["Gateway :9080\n(YARP proxy)"]
+
+    GW -->|"GET /suggestions"| SS["SuggestionService :9081\n(stateless read path)"]
+    GW -->|"POST /search-events"| CS["CollectionService :9082\n(stateless ingest)"]
+    GW -.->|"debug/insights only"| AG["Aggregator :9083"]
+    GW -.->|"debug/insights only"| TB["TrieBuilder :9084"]
+
+    SS -->|"GET trie:v{N}:{prefix}"| Redis[("Redis\ntrie:* namespace")]
+    SS -->|"poll current_version (5s)"| ZK[("ZooKeeper\n/suggestx/trie/current_version")]
+
+    CS -->|"PutRecord (awaited)"| FH["Kinesis Firehose\nsuggestx-search-events"]
+    FH -->|"batched delivery"| S3Raw[("S3\nsuggestx-raw-logs")]
+
+    AG -->|"ListObjectsV2 StartAfter(checkpoint)"| S3Raw
+    AG -->|"ADD frequency per phrase"| Dyn[("DynamoDB\nsuggestx-phrase-frequencies")]
+    AG -->|"read/write checkpoint"| DynCk[("DynamoDB\nsuggestx-aggregator-checkpoints")]
+
+    TB -->|"full Scan every cycle"| Dyn
+    TB -->|"write new version, then\ndelete old version's keys"| Redis
+    TB -->|"write v{N}.json"| S3Snap[("S3\nsuggestx-trie-snapshots")]
+    TB -->|"flip pointer, after\nRedis+S3 both succeed"| ZK
+```
+
+### Who owns what
+
+| Service | Port | Role | Owns (exclusively) | Reads (read-only) |
+|---|---|---|---|---|
+| `Gateway` | 9080 | YARP routing; the only thing a browser ever talks to | — | — |
+| `SuggestionService` | 9081 | Hot read path — one Redis `GET` per request | — (fully stateless) | Redis, ZooKeeper |
+| `CollectionService` | 9082 | Ingest — hands events to Firehose and forgets them | — (holds no state) | — |
+| `Aggregator` | 9083 | Batch job — turns raw logs into frequency counts | `suggestx-phrase-frequencies`, `suggestx-aggregator-checkpoints` | `suggestx-raw-logs` |
+| `TrieBuilder` | 9084 | Batch job — rebuilds the trie, publishes it | `trie:*` (Redis), `suggestx-trie-snapshots`, `/suggestx/trie/current_version` (ZooKeeper) | `suggestx-phrase-frequencies` |
+
+### Read path — one request, one cache `GET`
+
+The whole point of decision 2: a keystroke never pays for a trie traversal,
+a database query, or a cross-service call beyond one hop.
+
+```mermaid
+sequenceDiagram
+    participant U as Browser
+    participant GW as Gateway
+    participant SS as SuggestionService
+    participant R as Redis
+    participant ZK as ZooKeeper
+
+    Note over SS,ZK: background: SS polls ZK every 5s,<br/>caches current_version in memory
+    U->>GW: GET /api/suggestions?prefix=gui
+    GW->>SS: GET /suggestions?prefix=gui
+    SS->>R: GET trie:v{N}:gui
+    R-->>SS: ["guitar chords", "guitar lesson", "guitar solo"]
+    SS-->>GW: 200 OK
+    GW-->>U: 200 OK
+```
+
+No step in this path ever touches DynamoDB, S3, or does a ZooKeeper call —
+ZooKeeper reachability only gates the *background* poll, not the request
+itself (decision 16).
+
+### Write path — a search becomes a future suggestion
+
+The slow, offline side: a submitted search works its way through three
+independently-scheduled stages before it can ever appear in a suggestion
+list. Nothing here is synchronous beyond the initial `202`.
+
+```mermaid
+sequenceDiagram
+    participant U as Browser
+    participant GW as Gateway
+    participant CS as CollectionService
+    participant FH as Firehose
+    participant S3L as S3 (raw-logs)
+    participant AG as Aggregator
+    participant Dyn as DynamoDB (frequencies)
+    participant TB as TrieBuilder
+    participant Rd as Redis
+    participant S3S as S3 (snapshots)
+    participant ZK as ZooKeeper
+
+    U->>GW: POST /api/search-events {query}
+    GW->>CS: POST /search-events
+    CS->>FH: PutRecord (awaited — durability moves here)
+    FH-->>CS: accepted
+    CS-->>GW: 202 Accepted
+    GW-->>U: 202 Accepted
+    FH->>S3L: deliver record (own schedule)
+
+    loop every poll interval
+        AG->>S3L: ListObjectsV2 StartAfter(checkpoint)
+        S3L-->>AG: new objects, if any
+        AG->>Dyn: ADD frequency, per unique phrase
+        AG->>Dyn: advance checkpoint (only after ADD succeeds)
+    end
+
+    loop every build interval
+        TB->>Dyn: Scan every phrase + frequency
+        TB->>TB: build CompressedTrie, flatten to prefix→top-N
+        TB->>Rd: write trie:v{N+1}:* (new version, fully)
+        TB->>Rd: delete trie:v{N}:* (old version, only now)
+        TB->>S3S: write v{N+1}.json
+        TB->>ZK: set current_version = N+1 (last step)
+    end
+```
+
+The ordering inside each loop is not incidental — it's decision 8's
+blue/green rule applied at every layer: write the new thing completely,
+*then* remove the old thing, *then* tell anyone it changed. §1 decisions 14,
+15, 17 and 23 are all about what happens when a crash or outage lands
+*between* those steps instead of before or after them.
+
+### Key decisions at a glance
+
+The full reasoning for each of these is in §1 by number; this is a map, not
+a replacement for it.
+
+| # | Decision | Why, in one line |
+|---|---|---|
+| 1 | No relational database anywhere | Nothing in this system has a foreign-key relationship — a log, a counter, a blob, a cache, a coordinator |
+| 2 | Trie lives only in `TrieBuilder`; the read path is a flat cache `GET` | Moves all traversal cost offline, once per build cycle, instead of once per keystroke |
+| 3 | HDFS→S3, Cassandra→DynamoDB, MongoDB→S3 (not DynamoDB) | A serialized trie snapshot is a blob, not a queryable document — object storage fits its access pattern |
+| 4 | Real ZooKeeper container, not a Redis key | The design names a distinct coordination concept; this project's goal is understanding through a real instance, not a shortcut |
+| 5 | Prefix-range partitioning, not hash | Matches the doc's own example; keeps shard routing an explainable range check |
+| 6 | Flattened cache bounded to a max prefix length | Precomputing every prefix is only tractable up to a bound; past it, a documented degraded fallback kicks in |
+| 8 | Blue/green version swap, not in-place mutation | No locking needed on the read path; a failed build never affects what's currently served |
+| 11 | Firehose replaces the hand-rolled ingest buffer | Moves durability out of `CollectionService`'s process entirely — a crash can no longer lose an accepted event |
+| 14/15 | Versioned Redis keys + S3 snapshot + ZooKeeper pointer | Makes "which version is current and recoverable" durable and survivable across a `TrieBuilder` restart |
+| 16 | `SuggestionService` polls ZooKeeper, never calls it per-request | Consistent with every other poll-based handoff in this system; a request never pays for a ZooKeeper round trip |
+| 17/23 | Stale ZooKeeper pointer can outlive Redis data | A real, reproduced gap (ZK outage or a crash mid-publish) — self-heals within one cycle, accepted rather than closed |
+| 21 | Personalization reorders, never injects, candidates | Keeps the shared trie as the only candidate source — no per-user trie, no server-side profile |
+
 ## §1 Decision register
 
 Numbered chronologically. Each entry: the decision, the alternative(s)
