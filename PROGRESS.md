@@ -8,10 +8,10 @@ Say this to Claude at the start of the next session:
 > then continue Phase 7 — evaluation extras. Modules 1-2 (personalization,
 > remaining client-side optimizations + edge-cache headers) are done;
 > Module 3 (fault-tolerance verification) is in progress — TrieBuilder
-> crash mid-build is done and found a real gap (decision 23); remaining
-> scenarios are stopping Redis, killing SuggestionService, and stopping
-> LocalStack mid-request. Build in short modules, pausing after each one
-> so I can review before you continue.
+> crash mid-build (decision 23) and stopping Redis entirely (decision 25)
+> are both done; remaining scenarios are killing SuggestionService and
+> stopping LocalStack mid-request. Build in short modules, pausing after
+> each one so I can review before you continue.
 
 **Build in short modules.** One concept per module, verified and explained
 before moving on — same discipline as JameX.
@@ -38,7 +38,7 @@ state* and *Next up* sections at the end of every session.
 
 ## Current state
 
-**Last updated:** 2026-09-27
+**Last updated:** 2026-10-01
 **Phase 1 — local substrate. Complete, verified.**
 **Phase 2 — Collection Service. Complete, verified — and since rebuilt on
 Kinesis Data Firehose** in place of the original in-memory buffer/flush
@@ -100,8 +100,15 @@ tested with a real, precisely-timed `docker kill`, found a genuine gap
 (decision 23: a crash landing between a successful Redis publish and the
 ZooKeeper flip leaves ZooKeeper pointing at deleted data, causing real
 empty results, not stale ones), confirmed self-healing on restart.
-Remaining scenarios: stopping Redis, killing SuggestionService, stopping
-LocalStack mid-request.**
+Stopping Redis entirely tested next (decision 25): found and **fixed** a
+real gap — `SuggestionService` was throwing an unhandled exception (a raw
+500) on every request while Redis was down, despite an existing comment
+in the codebase saying it should degrade instead. `TrieBuilder` already
+handled the same outage correctly with no changes needed. Fix verified
+live against the identical outage, before and after; both sides confirmed
+to self-heal automatically with no restart once Redis returns.
+Remaining scenarios: killing SuggestionService, stopping LocalStack
+mid-request.**
 **Local debugging (cross-cutting, not a phase) — set up and verified.**
 Every service can now run under the Visual Studio debugger, on the exact
 port its container publishes, with the Gateway automatically reaching

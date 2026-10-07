@@ -105,8 +105,23 @@ public sealed class RedisSuggestionReader(
 
     private async Task<List<SuggestionItem>> FetchAsync(int version, string prefix)
     {
-        var db = redis.GetDatabase();
-        var value = await db.StringGetAsync($"trie:v{version}:{prefix}");
+        RedisValue value;
+        try
+        {
+            var db = redis.GetDatabase();
+            value = await db.StringGetAsync($"trie:v{version}:{prefix}");
+        }
+        catch (RedisException ex)
+        {
+            // Redis is this service's only store (decision 2) — there is
+            // nothing else to fall back to. "Must degrade, not crash" (see
+            // the connection-level comment in SuggestXHostingExtensions)
+            // means returning no suggestions, the same real, honest
+            // degradation already used for "no trie version known yet,"
+            // not letting an unhandled exception surface as a raw 500.
+            logger.LogError(ex, "Redis unreachable fetching {Prefix} at version {Version}", prefix, version);
+            return [];
+        }
 
         if (value.IsNullOrEmpty) return [];
 

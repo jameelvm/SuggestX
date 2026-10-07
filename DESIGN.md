@@ -164,6 +164,7 @@ a replacement for it.
 | 16 | `SuggestionService` polls ZooKeeper, never calls it per-request | Consistent with every other poll-based handoff in this system; a request never pays for a ZooKeeper round trip |
 | 17/23 | Stale ZooKeeper pointer can outlive Redis data | A real, reproduced gap (ZK outage or a crash mid-publish) — self-heals within one cycle, accepted rather than closed |
 | 21 | Personalization reorders, never injects, candidates | Keeps the shared trie as the only candidate source — no per-user trie, no server-side profile |
+| 25 | Redis-outage read path now degrades instead of crashing | Found live via a real `docker compose stop redis` — fixed, not just documented, unlike 17/23 |
 
 ## §1 Decision register
 
@@ -958,6 +959,64 @@ considered, and why this one won.
     same "two tabs, one driving, one only ever polling" verification
     shape already established for the insights panel (decision 20).
 
+25. **Phase 7's second fault-tolerance scenario — "Redis stops entirely" —
+    found a real gap on the read path and closed it, unlike decisions 17
+    and 23's deliberately-accepted ones.** `SuggestXHostingExtensions`
+    already configures the Redis connection with `AbortOnConnectFail =
+    false` specifically so a service can still *start* with Redis
+    unreachable, with a comment stating the intent plainly:
+    "SuggestionService in particular must degrade, not crash." That
+    comment covers the connection's construction, not what happens on a
+    live request once a previously-working connection actually drops —
+    `RedisSuggestionReader.FetchAsync` had no `try/catch` at all, so a
+    genuine outage threw an unhandled `RedisConnectionException` straight
+    through the controller.
+
+    **Verified live with a real `docker compose stop redis`, not a
+    mocked failure.** Before the fix: every request, direct and through
+    the Gateway, came back as a real `500` carrying the full exception
+    and stack trace (ASP.NET's Development-mode behavior) — about 5
+    seconds to fail, StackExchange.Redis's own `ConnectTimeout`, not a
+    fast-fail. `TrieBuilder`, by contrast, already had a `try/catch`
+    around its own Redis publish (built while handling decision 17's
+    ZooKeeper scenario) and handled this perfectly with no changes
+    needed: it logged `Failed to publish trie version {N} to Redis`,
+    kept its `BackgroundService` loop running, kept the version counter
+    advancing, and resumed clean publish/cleanup cycles the moment Redis
+    came back — confirmed by the next cycle's log line matching
+    "prefixes written" to "old keys removed" exactly, same as normal
+    operation.
+
+    **Fixed, not just documented:** `FetchAsync` now catches
+    `RedisException` (the base type covering connection and timeout
+    failures alike) around the `StringGetAsync` call, logs it, and
+    returns no suggestions — the same honest-degradation shape already
+    used for "no trie version known yet," not a silently wrong answer
+    and not a crash. Re-verified against the identical live outage after
+    the fix: both the direct and Gateway-proxied request returned `200`
+    with an empty suggestion list, and the failure was still logged
+    server-side (confirmed via `docker compose logs`), so the degradation
+    is honest, not a silent swallow.
+
+    **Both sides self-heal with no restart, confirmed live:**
+    `SuggestionService`'s own connection recovered automatically once
+    Redis was back (`ConnectRetry = 5` reconnecting in the background) —
+    a plain request succeeded again within seconds with nothing touched
+    by hand. `TrieBuilder`'s very next build cycle published and cleaned
+    up correctly, exactly as if the outage had never happened.
+
+    **A separate, pre-existing finding noticed along the way, not caused
+    by this test:** two orphaned Redis key sets (`trie:v2819:*` and a much
+    later `trie:v3785:*`, 65 keys each) were already sitting in Redis
+    before this test started, left over from this long-running dev
+    container's earlier fault-tolerance testing (the same decision 17/23
+    class of gap — a version's keys outliving the one ZooKeeper pointer
+    that's supposed to name the current version). Harmless (ZooKeeper
+    only ever points at one version, so these are simply dead, unreferenced
+    keys, not something being served), and left in place as further live
+    evidence of that already-documented, already-accepted gap rather than
+    a new one to chase down here.
+
 ## §2 Failure-mode table
 
 | Failure | Effect without mitigation | Mitigation in this build |
@@ -970,6 +1029,7 @@ considered, and why this one won.
 | ZooKeeper unreachable, briefly (shorter than one TrieBuilder build cycle) | `SuggestionService` cannot learn the current version | Mitigated: it caches the last-known version in memory and keeps serving it — confirmed live by stopping the real container. |
 | ZooKeeper unreachable for longer than one TrieBuilder build cycle | TrieBuilder's own Redis cleanup keeps rotating versions regardless of ZooKeeper reachability, eventually deleting the exact version SuggestionService is still frozen on | Not mitigated — found and reproduced live (decision 17), not just theorized. Self-heals within one cycle once ZooKeeper recovers, with no permanent corruption, but requests during the window can return empty results rather than merely stale ones. |
 | A Redis partition is unreachable | Every query for that prefix range fails | Redis's own primary-replica replication (not hand-rolled app failover) is the mitigation — matches how a real deployment would actually solve this, rather than inventing bespoke failover code. |
+| Redis is stopped entirely | `SuggestionService` threw an unhandled exception per request — a real `500` with a full stack trace, ~5s to fail (connect timeout) | Mitigated (decision 25): `RedisSuggestionReader` now catches `RedisException` and returns no suggestions, logged but not surfaced as an error. Verified live via a real `docker compose stop redis`, before and after the fix. `TrieBuilder` already handled this correctly with no changes needed. Both self-heal automatically once Redis returns, with no restart. |
 | A hot prefix range gets disproportionate load (e.g., everything starting "S") | One partition's servers overload while others idle | Named directly in the source doc as range partitioning's real weakness. Left as an open, unsolved question here (see §4) rather than hidden — a hash-based secondary partitioning layer is the real answer and is out of scope for this build. |
 | `PutRecord` to Firehose fails from `CollectionService` | Without care, the caller could get a false 202 for an event that was never durably accepted | `SearchEventsController` awaits `PutRecordAsync` before returning 202 and returns 503 on failure instead — the caller, not this service, decides whether to retry. See decision 11. |
 | `CollectionService` is killed ungracefully (SIGKILL, crash, OOM) | — | No longer a distinct risk: the service holds no buffer and no state to lose. An event is either durably in Firehose (202 already returned) or it never was (the client got an error and knows to retry). See decision 11 — this row is kept to show the failure mode decision 9 accepted is now closed, not to describe a live gap. |
